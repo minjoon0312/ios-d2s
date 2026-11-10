@@ -1,0 +1,74 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 341216d..ebb1f9f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -401,6 +401,48 @@ AppleCLCD::swap(const uint8_t *rec)
+  * 16.16 fixed point; the logical rect (dx,dy,w,h) of a layer maps to the
+  * panel rect it covers. (d2s_fb_scale is declared at the top of the file.)
+  */
++/*
++ * d1x: the full-canvas stretch (the usual backboardd swap) as row runs. Same
++ * pixels as the per-pixel loop in d2s_present_scaled, but each panel row is a
++ * few memcpy runs of one source row (1125 -> 1080 keeps 24 of every 25
++ * columns: 45 runs per row instead of 1080 16.16 steps).
++ */
++#define D2S_RUNS_MAX    128
++static struct {
++	uint16_t dst, src, len;
++} d2s_runs[D2S_RUNS_MAX];
++static uint32_t d2s_nruns, d2s_runs_pw, d2s_runs_lw;
++
++static bool
++d2s_build_runs(uint32_t pw, uint32_t lw, uint64_t ix)
++{
++	if (d2s_runs_pw == pw && d2s_runs_lw == lw) {
++		return d2s_nruns != 0;
++	}
++	d2s_runs_pw = pw;
++	d2s_runs_lw = lw;
++	d2s_nruns = 0;
++	uint64_t fx = ((uint64_t)1 << 15) * ix >> 16;  /* as the loop: px0 = ox = dx = 0 */
++	int64_t prev = -2;
++	for (uint32_t px = 0; px < pw; px++, fx += ix) {
++		int64_t lx = (int64_t)(fx >> 16);
++		lx = lx >= (int64_t)lw ? (int64_t)lw - 1 : lx;
++		if (d2s_nruns != 0 && lx == prev + 1) {
++			d2s_runs[d2s_nruns - 1].len++;
++		} else if (d2s_nruns < D2S_RUNS_MAX) {
++			d2s_runs[d2s_nruns].dst = (uint16_t)px;
++			d2s_runs[d2s_nruns].src = (uint16_t)lx;
++			d2s_runs[d2s_nruns].len = 1;
++			d2s_nruns++;
++		} else {
++			d2s_nruns = 0;          /* upscaling: too many runs, use the loop */
++			return false;
++		}
++		prev = lx;
++	}
++	return true;
++}
++
+ static void
+ d2s_present_scaled(uintptr_t panel, uint32_t rowBytes, uint32_t pw, uint32_t ph,
+     uint32_t lw, uint32_t lh, const uint8_t *src, uint32_t sbpr,
+@@ -420,6 +462,20 @@ d2s_present_scaled(uintptr_t panel, uint32_t rowBytes, uint32_t pw, uint32_t ph,
+ 			d2s_fb_cleared = true;
+ 		}
+ 	}
++	if (d2s_fb_scale == 1 && dx == 0 && dy == 0 && (uint32_t)w == lw && (uint32_t)h == lh &&
++	    d2s_build_runs(pw, lw, ((uint64_t)1 << 32) / kx)) {
++		uint64_t iy = ((uint64_t)1 << 32) / ky;
++		for (uint64_t py = 0; py < ph; py++) {
++			int64_t ly = (int64_t)(((py << 16) + (1 << 15)) * iy >> 32);
++			ly = ly >= h ? h - 1 : ly;
++			const uint32_t *srow = (const uint32_t *)(src + (uint64_t)(sy + ly) * sbpr) + sx;
++			uint32_t *drow = (uint32_t *)(panel + py * rowBytes);
++			for (uint32_t r = 0; r < d2s_nruns; r++) {
++				memcpy(drow + d2s_runs[r].dst, srow + d2s_runs[r].src, (size_t)d2s_runs[r].len * 4);
++			}
++		}
++		return;
++	}
+ 	/* rounded edges: the last logical column must reach the panel edge */
+ 	uint64_t px0 = ox + (((uint64_t)dx * kx + 0x8000) >> 16);
+ 	uint64_t px1 = ox + (((uint64_t)(dx + w) * kx + 0x8000) >> 16);

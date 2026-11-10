@@ -1,0 +1,57 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index e70a4ce..b976dd6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -102,7 +102,9 @@ extern void sweet_usb_probe(void);
+ #endif
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+-#define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
++#define CMD_SPIN_NS     (150ull * NSEC_PER_USEC)    /* ufswait=1: spin this long before sleeping */
++/* d1x: Linux never sends more than 128 PRDT entries (512 KiB) on this controller. */
++#define UFS_XFER_MAX    (512u << 10)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+ 
+ struct utrd {
+@@ -273,7 +275,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 				thread_block(THREAD_CONTINUE_NULL);
+ 			}
+ 		} else {
+-			delay(1);
++			/* d1x: spin; delay() always blocks on a timer here (no idle latency set). */
++			__builtin_arm_yield();
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
+@@ -482,7 +485,7 @@ sweet_ufs_strategy(buf_t bp)
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / UFS_BLOCK;
+ 		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+-		uint32_t want = MIN(count - done, BOUNCE_SIZE - skip);
++		uint32_t want = MIN(count - done, UFS_XFER_MAX - skip);
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+ 		void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 		if (rd) {
+@@ -556,14 +559,19 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		return error;
+ 	}
+ 	case DKIOCGETMAXBLOCKCOUNTREAD:
+-		*o = BOUNCE_SIZE / su.secsize;
++		*o = UFS_XFER_MAX / su.secsize;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+-		*o = su.writable ? BOUNCE_SIZE / su.secsize : 0;
++		*o = su.writable ? UFS_XFER_MAX / su.secsize : 0;
+ 		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+-		*o = 1;
++		/* strategy maps the whole buf and copies through the bounce buffer, so
++		 * any page layout works; 1 here split every read into 4 KiB commands. */
++		*o = UFS_XFER_MAX / PAGE_SIZE;
++		return 0;
++	case DKIOCISSOLIDSTATE:
++		*f = 1;
+ 		return 0;
+ 	default:
+ 		return ENOTTY;

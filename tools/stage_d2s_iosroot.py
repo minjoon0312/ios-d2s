@@ -16,8 +16,8 @@ if os.geteuid() != 0:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_DIR = SCRIPT_DIR.parent.parent.parent
-IPSW_DIR = REPO_DIR / "other_folders" / "ipsw_extracted"
-OUT_DIR = REPO_DIR / "other_folders"
+IPSW_DIR = Path(os.environ.get("IOS_IPSW_DIR", REPO_DIR / "other_folders" / "ipsw_extracted"))
+OUT_DIR = Path(os.environ.get("IOS_OUT_DIR", REPO_DIR / "other_folders"))
 SPARSE_IMG = OUT_DIR / "ios16-root.sparseimage"
 
 OS_DMG = IPSW_DIR / "087-86698-044.dmg"
@@ -79,7 +79,7 @@ if SPARSE_IMG.exists():
     SPARSE_IMG.unlink()
 
 subprocess.check_call([
-    "hdiutil", "create", "-size", "12g", "-type", "SPARSE",
+    "hdiutil", "create", "-size", "12g", "-type", "SPARSE", "-layout", "NONE",
     "-fs", "Case-sensitive Journaled HFS+", "-volname", "iOSRoot",
     str(OUT_DIR / "ios16-root")
 ])
