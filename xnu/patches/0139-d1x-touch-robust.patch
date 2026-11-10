@@ -1,0 +1,151 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 8de0c38..d1bb092 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -933,6 +933,75 @@ s8ts_wait(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++#if defined(D2S)
++/*
++ * d1x touch robustness (research/RESPONSIVE_9825.md 1.2, after Samsung sec_ts.c and the
++ * S8's enable retry): clear the event stack, retry the enable, recover from IC resets,
++ * never leave a finger down in iOS, back off a failing bus.
++ */
++static void
++s8ts_release_all(void)
++{
++	for (unsigned i = 0; i < S8TS_FINGERS; i++) {
++		if (s8ts_down[i]) {
++			s8ts_down[i] = false;
++			if (i < 5) {
++				sweet_hid_touch((int)i, 0, s8ts_x[i], s8ts_y[i]);
++			}
++		}
++	}
++}
++
++static void
++s8ts_clear_stack(void)
++{
++	uint8_t clr = 0x62;                                     /* CLEAR_EVENT_STACK */
++	(void)s8i2c_xfer(s8ts_i2c, S8TS_ADDR, &clr, 1, NULL, 0);
++}
++
++static bool
++s8ts_enable(void)
++{
++	uint8_t func[3] = {0x30, 0x01, 0x00};                  /* TOUCH_FUNCTION = touch */
++	uint8_t sense = 0x10;                                   /* SENSE_ON */
++	for (int i = 0; i < 20; i++) {
++		if (i) {
++			s8i2c_reset(s8ts_i2c);
++			delay(50000);
++		}
++		s8ts_clear_stack();
++		bool f = s8i2c_xfer(s8ts_i2c, S8TS_ADDR, func, 3, NULL, 0);
++		bool on = f && s8i2c_xfer(s8ts_i2c, S8TS_ADDR, &sense, 1, NULL, 0);
++		if (on) {
++			if (i) {
++				printf("S8 TOUCH: enabled after %d retries\n", i);
++			}
++			return true;
++		}
++		printf("S8 TOUCH: enable try %d: %s failed\n", i, f ? "SENSE_ON" : "TOUCH_FUNCTION");
++	}
++	return false;
++}
++
++/* Status events (eid 1). Returns true if the IC must be enabled again. */
++static bool
++s8ts_status(const uint8_t *ev)
++{
++	unsigned stype = (ev[0] >> 2) & 0xfu;
++	if (stype == 2 && ev[1] == 0x00 && ev[2] == 0x20) {    /* INFO BOOT_COMPLETE: IC reset */
++		printf("S8 TOUCH: IC reset (boot complete), enabling again\n");
++		s8ts_release_all();
++		return true;
++	}
++	if (stype == 1 && ev[1] == 0x01) {                      /* ERR QUEUE_FULL */
++		printf("S8 TOUCH: event queue full\n");
++		s8ts_clear_stack();
++		s8ts_release_all();
++	}
++	return false;
++}
++#endif /* D2S */
++
+ static void
+ s8ts_thread(void *arg, wait_result_t result)
+ {
+@@ -951,14 +1020,49 @@ s8ts_thread(void *arg, wait_result_t result)
+ 			if (++errors <= 8 || !(errors & 255)) {
+ 				printf("S8 TOUCH: event read failed (%u)\n", errors);
+ 			}
++#if defined(D2S)
++			if (errors == 64) {                         /* bus wedged: start over */
++				printf("S8 TOUCH: 64 failed reads, resetting the bus and enabling again\n");
++				s8i2c_reset(s8ts_i2c);
++				s8ts_release_all();
++				(void)s8ts_enable();
++				errors = 9;
++			}
++			s8ts_wait(errors > 8 ? 1000 : 20);          /* back off a failing bus */
++#else
+ 			s8ts_wait(20);
++#endif
+ 			continue;
+ 		}
+ 		unsigned left = buf[7] & S8TS_LEFT_MASK;
++#if defined(D2S)
++		if ((buf[0] & 3) == 3 || left > 30) {               /* invalid event: drop the stack */
++			s8ts_clear_stack();
++			s8ts_release_all();
++			continue;
++		}
++		if (buf[0] && left &&
++		    !s8ts_cmd_read(0x61, buf + S8TS_EVENT_SIZE, left * S8TS_EVENT_SIZE)) {   /* READ_ALL_EVENT */
++			/* a lost batch may hold releases: never leave a finger down in iOS */
++			s8ts_clear_stack();
++			s8ts_release_all();
++			left = 0;
++		}
++		bool reenable = false;
++		for (unsigned i = 0; i <= left; i++) {
++			if ((buf[i * S8TS_EVENT_SIZE] & 3) == 1 && s8ts_status(buf + i * S8TS_EVENT_SIZE)) {
++				reenable = true;
++			}
++		}
++		if (reenable) {
++			(void)s8ts_enable();
++		}
++#else
+ 		if (buf[0] && left && left < 32 &&
+ 		    !s8ts_cmd_read(0x61, buf + S8TS_EVENT_SIZE, left * S8TS_EVENT_SIZE)) {   /* READ_ALL_EVENT */
+ 			left = 0;
+ 		}
++#endif
+ 		if (!buf[0]) {
+ 			s8ts_wait(4);       /* INT low with an empty queue */
+ 			continue;
+@@ -1064,6 +1168,12 @@ dreamlte_touch_start(void)
+ 		printf("S8 TOUCH: S6SY761 id %02x%02x%02x\n", b[0], b[1], b[2]);
+ 	}
+ #endif
++#if defined(D2S)
++	if (!s8ts_enable()) {
++		printf("S8 TOUCH: enable sequence failed after 20 tries\n");
++		return;
++	}
++#else
+ 	uint8_t func[3] = {0x30, 0x01, 0x00};                  /* TOUCH_FUNCTION = touch */
+ 	uint8_t sense = 0x10;                                   /* SENSE_ON */
+ 	if (!s8i2c_xfer(s8ts_i2c, S8TS_ADDR, func, 3, NULL, 0) ||
+@@ -1071,6 +1181,7 @@ dreamlte_touch_start(void)
+ 		printf("S8 TOUCH: enable sequence failed\n");
+ 		return;
+ 	}
++#endif
+ 	if (kernel_thread_start(s8ts_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {

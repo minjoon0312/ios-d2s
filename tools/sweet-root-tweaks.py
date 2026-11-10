@@ -54,6 +54,82 @@ def merge_pref(root, name, values):
     print('pref', name, sorted(values))
 
 
+# --- speed profile (research/RESPONSIVE_9825.md section 4) ------------------------------------
+SPEED = int(os.environ.get('SWEET_SPEED', '1'))  # 0 as before, 1 speed profile, 2 + experiments
+
+# launchd skips a job whose Disabled is true (Apple's own cache has 36, syslogd and sntpd among
+# them). These crash-loop, wait on hardware this port lacks, or only write diagnostics.
+SPEED_DISABLE = (
+    'com.apple.ReportCrash', 'com.apple.crash_mover', 'com.apple.DumpPanic',
+    'com.apple.OTACrashCopier', 'com.apple.DumpBasebandCrash', 'com.apple.spindump',
+    'com.apple.tailspind', 'com.apple.hangtracerd', 'com.apple.hangreporter',
+    'com.apple.systemstats.microstackshot_periodic', 'com.apple.osanalytics.osanalyticshelper',
+    'com.apple.perfdiagsselfenabled',
+    'com.apple.bluetoothd', 'com.apple.bluetoothuserd', 'com.apple.cloudpaird',
+    'com.apple.locationd', 'com.apple.gpsd', 'com.apple.WirelessRadioManager',
+    'com.apple.CommCenterMobileHelper', 'com.apple.CommCenterRootHelper', 'com.apple.abm-helper',
+    'com.apple.voicemail.vmd', 'com.apple.biometrickitd.pearl', 'com.apple.nfcd',
+    'com.apple.thermalmonitord',
+    'com.apple.fairplayd.H2', 'com.apple.nanotimekitcompaniond', 'com.apple.nanoprefsyncd.2',
+    'com.apple.homed', 'com.apple.routined', 'com.apple.duetexpertd', 'com.apple.dmd',
+    'com.apple.syncdefaultsd', 'com.apple.avconferenced',
+    'com.apple.mobile.softwareupdated', 'com.apple.softwareupdateservicesd', 'com.apple.backupd',
+    'com.apple.bird', 'com.apple.photoanalysisd', 'com.apple.mediaanalysisd',
+    'com.apple.checkerboard', 'com.apple.factory.NFQRCoded',
+)
+# Started at boot today, needed only when asked: keep the Mach services, drop self-start keys.
+SPEED_ON_DEMAND = (
+    'com.apple.assistantd', 'com.apple.healthd', 'com.apple.remindd', 'com.apple.peopled',
+    'com.apple.sleepd', 'com.apple.familynotification', 'com.apple.askpermissiond',
+    'com.apple.accessoryupdaterd', 'com.apple.safetyalertsd', 'com.apple.wcd',
+    'com.apple.magicswitchd.companion', 'com.apple.navd', 'com.apple.identityservicesd',
+    'com.apple.imagent', 'com.apple.sharingd', 'com.apple.mediaremoted',
+    'com.apple.peakpowermanagerd', 'com.apple.MobileInternetSharing', 'com.apple.aggregated',
+    'com.apple.amsaccountsd', 'com.apple.seld', 'com.apple.atc',
+)
+# Never touched (y2sios lost the home screen without nsurlsessiond; the rest are what launchd,
+# backboardd, SpringBoard and our AKS/activation/IOWatchdog stand-ins rely on).
+SPEED_KEEP = {
+    'com.apple.nsurlsessiond', 'com.apple.cloudd', 'com.apple.analyticsd', 'com.apple.dasd',
+    'com.apple.mediaserverd', 'com.apple.lsd', 'com.apple.wifid', 'com.apple.watchdogd',
+    'com.apple.mobile.keybagd', 'com.apple.mobile.lockdown', 'com.apple.mobileactivationd',
+    'com.apple.backboardd', 'com.apple.SpringBoard', 'com.apple.runningboardd',
+    'com.apple.configd', 'com.apple.logd',
+}
+AUTOSTART = ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
+             'QueueDirectories', 'StartOnMount', 'LaunchEvents')
+BACKGROUND_EVENTS = ('com.apple.xpc.activity', 'com.apple.bg.system.task')
+
+
+def speed_jobs(jobs):
+    """Disable, make on-demand, and drop scheduled background triggers (SWEET_SPEED >= 1)."""
+    disabled, demand, events = [], [], 0
+    for job in jobs.values():
+        label = job.get('Label')
+        if label in SPEED_KEEP:
+            continue
+        if label in SPEED_DISABLE:
+            if not job.get('Disabled'):
+                job['Disabled'] = True
+                disabled.append(label)
+            continue
+        if label in SPEED_ON_DEMAND:
+            if [k for k in AUTOSTART if job.pop(k, None) is not None]:
+                demand.append(label if job.get('MachServices') else label + ' (no service: never starts)')
+            continue
+        le = job.get('LaunchEvents')
+        if le:
+            for ev in BACKGROUND_EVENTS:
+                if le.pop(ev, None) is not None:
+                    events += 1
+            if not le:
+                del job['LaunchEvents']
+    print(f'speed: {len(disabled)} disabled, {len(demand)} on demand, '
+          f'{events} background-task triggers removed')
+    for label in disabled + demand:
+        print('   ', label)
+
+
 def launchd(root):
     path = os.path.join(root, 'System/Library/xpc/launchd.plist')
     st = os.stat(path)
@@ -67,6 +143,8 @@ def launchd(root):
     removed = [k for k, j in jobs.items() if j.get('Label') == 'com.apple.CommCenter']
     for k in removed:
         del jobs[k]
+    if SPEED >= 1:
+        speed_jobs(jobs)
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
 
@@ -133,10 +211,21 @@ def main():
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
-    merge_pref(root, 'com.apple.springboard', {
+    springboard = {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
-        'MCForceShowCloudConfigurationUI': False})
+        'MCForceShowCloudConfigurationUI': False}
+    if SPEED >= 1:
+        springboard['FBLaunchWatchdogScale'] = 20            # as hakios: slow launches not killed
+        merge_pref(root, 'com.apple.frontboard', {'FBLaunchWatchdogScale': 20})
+        merge_pref(root, 'com.apple.Accessibility', {
+            'EnhancedBackgroundContrastEnabled': True,      # Reduce Transparency: no live blurs
+            'ReduceMotionEnabled': True})                   # cross-fades, no parallax/zoom
+        merge_pref(root, 'com.apple.assistant.support', {'Assistant Enabled': False})
+    if SPEED >= 2:                                          # unverified, measure each
+        springboard['SBDontLockEver'] = True
+        merge_pref(root, 'com.apple.UIKit', {'UIAnimationDragCoefficient': 0.5})
+    merge_pref(root, 'com.apple.springboard', springboard)
     merge_pref(root, 'com.apple.purplebuddy', {
         'SetupDone': True, 'SetupFinishedAllSteps': True, 'SetupVersion': 11,
         'daemonizeNeedsToRun': False})
