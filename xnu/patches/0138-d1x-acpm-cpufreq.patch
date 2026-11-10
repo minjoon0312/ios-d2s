@@ -1,0 +1,573 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b7272ef..84d9296 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/d2s_gpu.c			standard
++bsd/dev/d2s_cpufreq.c			standard
+ bsd/kern/d2s_files.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 8de0c38..c458419 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1081,6 +1081,7 @@ dreamlte_touch_start(void)
+ 
+ extern void d2s_gpu_start(void);
+ extern void d2s_files_start(void);
++extern void d2s_cpufreq_start(void);
+ 
+ void
+ a5xelte_touch_probe(void)
+@@ -1089,6 +1090,7 @@ a5xelte_touch_probe(void)
+ 	dreamlte_touch_start();   /* the A5 path below stays off */
+ #endif
+ #if defined(D2S)
++	d2s_cpufreq_start();      /* CPU clocks over ACPM, boot-arg d2scpufreq (d2s_cpufreq.c) */
+ 	d2s_gpu_start();          /* Mali-G76 core + boot self-test (d2s_gpu.c) */
+ 	d2s_files_start();        /* boot-image files into the iOS root (d2s_files.c) */
+ #endif
+diff --git a/bsd/dev/d2s_cpufreq.c b/bsd/dev/d2s_cpufreq.c
+new file mode 100644
+index 0000000..6c21cd3
+--- /dev/null
++++ b/bsd/dev/d2s_cpufreq.c
+@@ -0,0 +1,535 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Galaxy Note 10 / Note 10+ (d1x / d2s, Exynos 9825): CPU cluster clocks
++ * through ACPM, the power-management firmware on the APM core. Port of the
++ * Galaxy S8 patch 0127 (bsd/dev/s8_cpufreq.c, Exynos 8895) to the 9820
++ * family. Sources: Samsung's 9820 kernel (CruelKernel cruel-HVJ5-v5.3)
++ * drivers/soc/samsung/acpm/{acpm_ipc.c,acpm.c,fw_header/framework.h,
++ * fw_header/common.h}, cal-if/{acpm_dvfs.c,fvmap.c,cal-if.c},
++ * cal-if/exynos9820/{acpm_dvfs_exynos9820.h,cmucal-sfr.c,cmucal-node.c},
++ * and exynos9825.dts. GPL-2.0 like those sources.
++ *
++ * What differs from the 8895 version:
++ *  - mailbox 0x15900000, APM SRAM 0x02039000 (0x30000 bytes), framework
++ *    descriptor at +0x7000: the values the loader's shim/d2s/s2mps19.c
++ *    already uses for the touch rails on the d2s (commit d054c24);
++ *  - DVFS requests go on the channel whose id is 0: the DT clock-controller
++ *    node carries acpm-ipc-channel = <0> and cal_if_init() hands that node to
++ *    acpm_dvfs (exynos_acpm_set_device), so acpm_dvfs.ch_num is 0 by design
++ *    (the acpm_dvfs node's channel 5 is only the MIF notification channel);
++ *  - the DVFS plugin is resident and attached by the firmware (no
++ *    dynamic-plugins node in the DT): nothing is loaded, attached or
++ *    detached; its rate/voltage map is at plugin base + fvmap_offset 0xa400;
++ *  - struct plugin is 48 bytes (the 9820 common.h adds extern_func_mask;
++ *    the S8 found 44 on the 8895); both layouts are tried;
++ *  - ACPM ids: dvfs_cpucl0 (A55) 2, dvfs_cpucl1 (A75) 3, dvfs_cpucl2 (M4) 4.
++ *    On the 8895 id 4 was G3D; on the 9820 G3D is 10;
++ *  - map levels whose voltage is 0 are disabled and never asked for (the S8
++ *    froze asking MIF for such a level);
++ *  - the big cluster: Samsung's d1x kernel (CONFIG_EXYNOS_PSTATE_HAFM=y)
++ *    sends its requests through the HIU, not ACPM, and only with the
++ *    cluster kept awake (need-awake). Here it is opt-in only.
++ *
++ * Never write the CPU PLLs directly: the S8 loader's s8boost did, the PLL
++ * did not relock and the A53s ran from the 26 MHz oscillator.
++ *
++ * Boot-args (kHz; the highest enabled map level <= the value is asked for):
++ *   d2scpufreq=KHZ      A55 cluster (cpus 0-3); unset, 0 or 1: read only
++ *   d2scpufreq_mid=KHZ  A75 cluster (cpus 4-5), opt-in
++ *   d2scpufreq_big=KHZ  M4 cluster (cpus 6-7), opt-in; its cores must be up
++ *   d2scpufreq_cmu=1    also read the CPUCL1/CPUCL2 CMUs and ask ACPM for
++ *                       their rates (those clusters may be powered down)
++ *   d2scpufreq_off=1    touch nothing
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++#include <libkern/libkern.h>
++
++void d2s_cpufreq_start(void);
++
++#if defined(D2S)
++
++/* Not exported to BSD code by the headers; same approach as d2s_gpu.c. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define LOG(fmt, ...)   printf("D2S CPUFREQ: " fmt "\n", ##__VA_ARGS__)
++
++/* exynos9825.dts acpm_ipc: reg = <0x15900000 0x1000>, <0x02039000 0x30000>; initdata-base = <0x7000> */
++#define MBOX_PA         0x15900000UL
++#define SRAM_PA         0x02039000UL
++#define SRAM_SIZE       0x30000u
++#define INITDATA_OFF    0x7000u
++/* acpm_ipc.h */
++#define INTGR0          0x08
++#define INTCR1          0x20
++#define INTSR1          0x28
++#define SEQ_SHIFT       16
++/* exynos9825.dts acpm node: fvmap_offset = <0xa400>, from the DVFS plugin's base (acpm.c plugins_init) */
++#define FVMAP_OFFSET    0xa400u
++/* clock-controller@0x1a240000: acpm-ipc-channel = <0x0> */
++#define DVFS_CH_ID      0u
++/* cal-if/acpm_dvfs.h */
++#define FREQ_REQ        0
++#define FREQ_GET        1
++
++/* fw_header/framework.h struct acpm_framework, all u32 */
++#define FW_PLUGINS      0
++#define FW_NUM_PLUGINS  1
++#define FW_IPC_CHANNELS 2
++#define FW_IPC_AP_MAX   6
++/* struct ipc_channel: id, field, owner, type, struct channel_info (13 u32), ap_poll */
++#define CH_WORDS        18
++#define CH_ID           0
++#define CH_OWNER        2
++#define CH_TYPE         3
++#define CH_RX_REAR      4       /* AP -> APM queue (the firmware's rx) */
++#define CH_RX_FRONT     5
++#define CH_RX_BASE      6
++#define CH_TX_REAR      10      /* APM -> AP queue */
++#define CH_TX_FRONT     11
++#define CH_TX_BASE      12
++#define CH_Q_LEN        13
++#define CH_Q_ELEM       14
++#define CH_AP_POLL      17
++#define TYPE_QUEUE      1       /* framework.h enum: TYPE_QUEUE = 1, TYPE_BUFFER */
++
++/* fvmap.h struct fvmap_header: 24 bytes, one per ACPM id */
++#define FVH_BYTES       24
++#define FVH_NUM_LV      1
++#define FVH_INIT_LV     8
++#define FVH_O_RATEVOLT  0x14
++
++#define FIN_MHZ         26
++
++static volatile uint8_t *mbox, *sram;
++static uint32_t ch[CH_WORDS];
++static uint32_t seq;
++static uint32_t chans_off, chans_count;
++static uint32_t fvmap_off;
++
++static inline uint32_t sr(uint32_t o) { return *(volatile uint32_t *)(sram + o); }
++static inline void sw(uint32_t o, uint32_t v) { *(volatile uint32_t *)(sram + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++static inline uint32_t mr(uint32_t o) { return *(volatile uint32_t *)(mbox + o); }
++static inline void mw(uint32_t o, uint32_t v) { *(volatile uint32_t *)(mbox + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++
++/*
++ * Cluster clock tables from exynos9825.dts (cpufreq domain@0..2, the
++ * dm-constraints rows), used only if the firmware's fvmap is not found.
++ * dt_max is the domain's max-freq; above it on the M4 is the HIU boost range.
++ */
++static const uint32_t cl0_levels[] = { 1950000, 1846000, 1742000, 1586000, 1456000, 1300000, 1157000,
++	                               1053000, 949000, 806000, 650000, 546000, 442000 };
++static const uint32_t cl1_levels[] = { 2400000, 2314000, 2210000, 2106000, 2002000, 1898000, 1794000,
++	                               1690000, 1586000, 1508000, 1404000, 1222000, 1066000, 962000, 845000,
++	                               754000, 650000 };
++static const uint32_t cl2_levels[] = { 2080000, 1976000, 1820000, 1664000, 1560000, 1456000, 1378000,
++	                               1248000, 1144000, 1040000, 936000, 819000, 728000, 624000, 520000 };
++
++struct dom {
++	uint32_t        id;             /* acpm_dvfs_exynos9820.h */
++	const char     *name;
++	const char     *arg;
++	uint32_t        dt_max;         /* kHz */
++	vm_offset_t     cmu_pa;         /* cmucal-sfr.c SFR_BLOCK */
++	uint32_t        pll_con0, mux, div;
++	const uint32_t *levels;
++	unsigned        nlevels;
++};
++
++static const struct dom doms[3] = {
++	{ 2, "A55 (cl0)", "d2scpufreq", 1950000, 0x1d020000UL, 0x160, 0x1000, 0x1818,
++	  cl0_levels, sizeof(cl0_levels) / sizeof(cl0_levels[0]) },
++	{ 3, "A75 (cl1)", "d2scpufreq_mid", 2400000, 0x1d030000UL, 0x120, 0x1000, 0x1804,
++	  cl1_levels, sizeof(cl1_levels) / sizeof(cl1_levels[0]) },
++	{ 4, "M4 (cl2)", "d2scpufreq_big", 2080000, 0x1d120000UL, 0x120, 0x1000, 0x1810,
++	  cl2_levels, sizeof(cl2_levels) / sizeof(cl2_levels[0]) },
++};
++
++/*
++ * The clock the calling CPU runs at: 100 dependent adds per iteration take
++ * 100 cycles on A55, A75 and M4 alike (single-cycle ALU latency; the loop
++ * counter and branch issue alongside). No PMU access, so nothing EL2 could
++ * trap. Interrupts off so the thread stays on this CPU.
++ */
++static uint32_t
++measure_mhz(const char *when)
++{
++	const uint64_t iters = 50000;   /* 5,000,000 cycles: 2.6 ms at 1.95 GHz, 192 ms at 26 MHz */
++	uint64_t x = 0, n = iters, t0, t1, ns = 0, mpidr, midr;
++	boolean_t istate = ml_set_interrupts_enabled(FALSE);
++
++	__asm__ volatile ("mrs %0, mpidr_el1" : "=r"(mpidr));
++	__asm__ volatile ("mrs %0, midr_el1" : "=r"(midr));
++	t0 = mach_absolute_time();
++	__asm__ volatile (
++		"1:\n"
++		".rept 100\n"
++		"add %0, %0, #1\n"
++		".endr\n"
++		"subs %1, %1, #1\n"
++		"b.ne 1b\n"
++		: "+r"(x), "+r"(n) : : "cc");
++	t1 = mach_absolute_time();
++	ml_set_interrupts_enabled(istate);
++	absolutetime_to_nanoseconds(t1 - t0, &ns);
++	uint32_t mhz = ns ? (uint32_t)(iters * 100 * 1000 / ns) : 0;
++	LOG("%s: mpidr %#llx midr %#llx runs at ~%u MHz (%llu cycles in %llu ns)", when,
++	    mpidr & 0xffffffULL, midr, mhz, iters * 100, ns);
++	return mhz;
++}
++
++/* PLL_CON0 (cmucal-sfr.c, ra.c): ENABLE 31, STABLE 29, M 25:16, P 13:8, S 2:0, MUX_SEL 4 (1 = PLL out) */
++static uint32_t
++pll_mhz(uint32_t v)
++{
++	if (!(v & (1u << 31))) {
++		return (v & (1u << 4)) ? 0 : FIN_MHZ;   /* ra_get_pll_rate(): off = OSCCLK */
++	}
++	if (!(v & (1u << 4))) {
++		return FIN_MHZ;                         /* enabled, but the PLL mux still picks OSCCLK */
++	}
++	uint32_t m = (v >> 16) & 0x3ff, p = (v >> 8) & 0x3f, s = v & 7;
++	return p ? (uint32_t)((uint64_t)FIN_MHZ * m / ((uint64_t)p << s)) : 0;
++}
++
++static void
++log_cmu(const struct dom *d, const char *when)
++{
++	static volatile uint8_t *cmu[3];
++	unsigned i = (unsigned)(d - doms);
++	if (!cmu[i]) {
++		cmu[i] = (volatile uint8_t *)ml_io_map(d->cmu_pa, 0x2000);
++		if (!cmu[i]) {
++			LOG("%s: CMU map failed", d->name);
++			return;
++		}
++	}
++	volatile uint8_t *c = cmu[i];
++	uint32_t pll = *(volatile uint32_t *)(c + d->pll_con0);
++	uint32_t mux = *(volatile uint32_t *)(c + d->mux);
++	uint32_t div = *(volatile uint32_t *)(c + d->div);
++	LOG("%s %s: PLL_CON0 %#x = %u MHz (stable %u), CLK_PLL mux %#x (sel %u), CPU div %#x", when, d->name,
++	    pll, pll_mhz(pll), (pll >> 29) & 1, mux, mux & 1, div);
++	if (i == 0) {
++		/* MUX_PLL_CPUCL0 picks PLL_CPUCL0 (0) or APLL_CPUCL0 (1); MUX_CLK_CPUCL0_PLL sel 1 = CPUCL0_SWITCH_USER */
++		uint32_t apll = *(volatile uint32_t *)(c + 0x100);
++		LOG("%s %s: APLL_CPUCL0 %#x = %u MHz, MUX_PLL_CPUCL0 %#x, SWITCH_USER %#x", when, d->name,
++		    apll, pll_mhz(apll), *(volatile uint32_t *)(c + 0x1008), *(volatile uint32_t *)(c + 0x140));
++	}
++}
++
++static int
++load_channel_id(uint32_t id)
++{
++	for (uint32_t c = 0; c < chans_count && c < 32; c++) {
++		uint32_t b = chans_off + c * CH_WORDS * 4;
++		if (b + CH_WORDS * 4 > SRAM_SIZE) {
++			break;
++		}
++		if (sr(b) != id) {
++			continue;
++		}
++		for (unsigned w = 0; w < CH_WORDS; w++) {
++			ch[w] = sr(b + w * 4);
++		}
++		return 0;
++	}
++	return -1;
++}
++
++/*
++ * One request on the queue channel in ch[] (acpm_ipc.c __acpm_ipc_send_data
++ * and check_response, polled); the reply with our sequence number replaces
++ * cmd[]. 0 or an errno.
++ */
++static int
++acpm_call(uint32_t cmd[4])
++{
++	uint32_t len = ch[CH_Q_LEN], elem = ch[CH_Q_ELEM];
++	uint32_t front = sr(ch[CH_RX_FRONT]);
++	if (front >= len) {
++		return EIO;
++	}
++	uint32_t next = (front + 1) % len;
++
++	for (int i = 0; i < 1000 && next == sr(ch[CH_RX_REAR]); i++) {
++		delay(10);
++	}
++	if (next == sr(ch[CH_RX_REAR])) {
++		return EBUSY;                   /* queue full */
++	}
++	if (++seq >= 64) {
++		seq = 1;
++	}
++	cmd[0] |= seq << SEQ_SHIFT;
++	for (unsigned w = 0; w * 4 < elem; w++) {
++		sw(ch[CH_RX_BASE] + elem * front + w * 4, w < 4 ? cmd[w] : 0);
++	}
++	sw(ch[CH_RX_FRONT], next);
++	mw(INTGR0, (1u << ch[CH_ID]) << 16);
++
++	for (int t = 0; t < 50000; t++) {       /* 500 ms; Linux waits 15 ms, up to 6 times */
++		uint32_t rear = sr(ch[CH_TX_REAR]), f = sr(ch[CH_TX_FRONT]);
++		if (rear >= len || f >= len) {
++			return EIO;
++		}
++		for (uint32_t i = rear; i != f; i = (i + 1) % len) {
++			uint32_t w0 = sr(ch[CH_TX_BASE] + elem * i);
++			if (((w0 >> SEQ_SHIFT) & 0x3f) != seq) {
++				continue;
++			}
++			for (unsigned w = 0; w < 4 && w * 4 < elem; w++) {
++				cmd[w] = sr(ch[CH_TX_BASE] + elem * i + w * 4);
++			}
++			if (i != rear) {        /* as check_response(): the entry at rear moves into the hole */
++				for (unsigned w = 0; w * 4 < elem; w++) {
++					sw(ch[CH_TX_BASE] + elem * i + w * 4, sr(ch[CH_TX_BASE] + elem * rear + w * 4));
++				}
++			}
++			rear = (rear + 1) % len;
++			sw(ch[CH_TX_REAR], rear);
++			if (rear == sr(ch[CH_TX_FRONT])) {
++				mw(INTCR1, 1u << ch[CH_ID]);
++			}
++			return 0;
++		}
++		delay(10);
++	}
++	LOG("timeout: seq %u, intsr1 %#x, apm->ap rear %u front %u", seq, mr(INTSR1), sr(ch[CH_TX_REAR]),
++	    sr(ch[CH_TX_FRONT]));
++	return ETIMEDOUT;
++}
++
++static void
++sram_string(uint32_t off, char *out, unsigned n)
++{
++	unsigned i = 0;
++	for (; off && off + i < SRAM_SIZE && i + 1 < n; i++) {
++		char c = (char)sram[off + i];
++		if (c == 0) {
++			break;
++		}
++		out[i] = (c >= 32 && c < 127) ? c : '.';
++	}
++	out[i] = 0;
++}
++
++static bool
++has_dvfs(const char *s)
++{
++	for (; *s; s++) {
++		if ((s[0] == 'd' || s[0] == 'D') && (s[1] == 'v' || s[1] == 'V') && (s[2] == 'f' || s[2] == 'F') &&
++		    (s[3] == 's' || s[3] == 'S')) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* A rate map whose A55 entry looks like one: 1-32 levels, the first in 1-3 GHz. */
++static bool
++fvmap_plausible(uint32_t f)
++{
++	if (f + FVH_BYTES * 16 > SRAM_SIZE) {
++		return false;
++	}
++	uint32_t h = f + FVH_BYTES * 2, lv = sram[h + FVH_NUM_LV];
++	uint32_t o_rv = sram[h + FVH_O_RATEVOLT] | (uint32_t)sram[h + FVH_O_RATEVOLT + 1] << 8;
++	if (lv == 0 || lv > 32 || o_rv == 0 || f + o_rv + 8 * lv > SRAM_SIZE) {
++		return false;
++	}
++	uint32_t r0 = sr(f + o_rv);
++	return r0 >= 1000000 && r0 <= 3000000;
++}
++
++/*
++ * List the plugins (read only) and find the resident DVFS plugin's fvmap
++ * (acpm.c plugins_init(): attached and stay_attached -> base + fvmap_offset).
++ * 9820 struct plugin: id 0, base_addr 4, acpm_ops 8, plugin_ops 12,
++ * secure_func_mask 16, extern_func_mask 20, timer 24..31, is_attached 32,
++ * size 36, stay_attached 40, fw_name 44 (48 bytes). The 8895 layout the S8
++ * read (44 bytes, no extern_func_mask) is tried second.
++ */
++static void
++find_fvmap(void)
++{
++	static const struct { uint32_t bytes, attached, size, stay, name; } lay[2] = {
++		{ 48, 32, 36, 40, 44 }, { 44, 28, 32, 36, 40 } };
++	uint32_t table = sr(INITDATA_OFF + FW_PLUGINS * 4), count = sr(INITDATA_OFF + FW_NUM_PLUGINS * 4);
++	LOG("plugins: table %#x count %u", table, count);
++	if (table == 0 || table >= SRAM_SIZE || count == 0 || count > 32) {
++		return;
++	}
++	for (unsigned l = 0; l < 2 && !fvmap_off; l++) {
++		for (uint32_t i = 0; i < count; i++) {
++			uint32_t b = table + i * lay[l].bytes;
++			if (b + lay[l].bytes > SRAM_SIZE) {
++				break;
++			}
++			uint32_t id = sr(b), base = sr(b + 4), size = sr(b + lay[l].size), name = sr(b + lay[l].name);
++			uint8_t attached = sram[b + lay[l].attached], stay = sram[b + lay[l].stay];
++			char n[48];
++			sram_string(name < SRAM_SIZE ? name : 0, n, sizeof(n));
++			LOG("layout %u plugin %u: id %u base %#x size %u attached %u stay %u name \"%s\"", lay[l].bytes, i,
++			    id, base, size, attached, stay, n);
++			if (!has_dvfs(n)) {
++				continue;
++			}
++			uint32_t f = (base & ~1u) + FVMAP_OFFSET;
++			if (!attached || !stay) {
++				LOG("DVFS plugin not resident (Linux would load or detach it here): no fvmap");
++				continue;
++			}
++			if (fvmap_plausible(f)) {
++				fvmap_off = f;
++				LOG("fvmap at SRAM +%#x", f);
++				break;
++			}
++			LOG("no plausible fvmap at SRAM +%#x", f);
++		}
++	}
++}
++
++/* Highest enabled level <= limit (and <= the DT max); logs the map. 0 if none. */
++static uint32_t
++pick_rate(const struct dom *d, uint32_t limit)
++{
++	uint32_t best = 0;
++	if (limit > d->dt_max) {
++		limit = d->dt_max;
++	}
++	if (fvmap_off) {
++		uint32_t h = fvmap_off + FVH_BYTES * d->id;
++		uint32_t lv = sram[h + FVH_NUM_LV], init = sram[h + FVH_INIT_LV];
++		uint32_t o_rv = sram[h + FVH_O_RATEVOLT] | (uint32_t)sram[h + FVH_O_RATEVOLT + 1] << 8;
++		LOG("fvmap id %u (%s): %u levels, init level %u, table at +%#x", d->id, d->name, lv, init, o_rv);
++		for (uint32_t i = 0; i < lv && i < 32 && fvmap_off + o_rv + 8 * i + 8 <= SRAM_SIZE; i++) {
++			uint32_t rate = sr(fvmap_off + o_rv + 8 * i), volt = sr(fvmap_off + o_rv + 8 * i + 4);
++			LOG("fvmap id %u lv %u: %u kHz %u uV%s", d->id, i, rate, volt, volt ? "" : " (disabled)");
++			if (volt && rate <= limit && rate > best) {
++				best = rate;
++			}
++		}
++		return best;
++	}
++	for (unsigned i = 0; i < d->nlevels; i++) {
++		if (d->levels[i] <= limit && d->levels[i] > best) {
++			best = d->levels[i];
++		}
++	}
++	LOG("%s: no fvmap, DT table level %u kHz", d->name, best);
++	return best;
++}
++
++static uint32_t
++get_rate(uint32_t id)
++{
++	uint32_t cmd[4] = { id, 0, FREQ_GET, 0 };
++	int e = acpm_call(cmd);
++	return e ? 0 : cmd[1];
++}
++
++void
++d2s_cpufreq_start(void)
++{
++	static bool done;
++	uint32_t want[3] = { 0, 0, 0 }, cmu_all = 0, off = 0;
++
++	if (done) {
++		return;
++	}
++	done = true;
++	PE_parse_boot_argn("d2scpufreq_off", &off, sizeof(off));
++	if (off) {
++		return;
++	}
++	for (int d = 0; d < 3; d++) {
++		PE_parse_boot_argn(doms[d].arg, &want[d], sizeof(want[d]));
++	}
++	if (want[0] == 1) {     /* "d2scpufreq=1": read only */
++		want[0] = 0;
++	}
++	PE_parse_boot_argn("d2scpufreq_cmu", &cmu_all, sizeof(cmu_all));
++
++	measure_mhz("boot");
++	log_cmu(&doms[0], "boot");
++	if (cmu_all) {
++		log_cmu(&doms[1], "boot");
++		log_cmu(&doms[2], "boot");
++	}
++
++	mbox = (volatile uint8_t *)ml_io_map(MBOX_PA, 0x1000);
++	sram = (volatile uint8_t *)ml_io_map(SRAM_PA, SRAM_SIZE);
++	if (!mbox || !sram) {
++		LOG("map failed");
++		return;
++	}
++	chans_off = sr(INITDATA_OFF + FW_IPC_CHANNELS * 4);
++	chans_count = sr(INITDATA_OFF + FW_IPC_AP_MAX * 4);
++	LOG("framework: ipc_channels %#x ap channels %u, intsr1 %#x", chans_off, chans_count, mr(INTSR1));
++	if (chans_off == 0 || chans_off >= SRAM_SIZE || chans_count == 0 || chans_count > 32) {
++		LOG("no channel table, stopping");
++		return;
++	}
++	find_fvmap();
++	if (load_channel_id(DVFS_CH_ID)) {
++		LOG("no channel with id %u, stopping", DVFS_CH_ID);
++		return;
++	}
++	LOG("dvfs channel: id %u owner %#x type %u q_len %u elem %u poll %u ap->apm %#x/%#x/%#x apm->ap %#x/%#x/%#x",
++	    ch[CH_ID], ch[CH_OWNER], ch[CH_TYPE], ch[CH_Q_LEN], ch[CH_Q_ELEM], ch[CH_AP_POLL], ch[CH_RX_REAR],
++	    ch[CH_RX_FRONT], ch[CH_RX_BASE], ch[CH_TX_REAR], ch[CH_TX_FRONT], ch[CH_TX_BASE]);
++	if (ch[CH_TYPE] != TYPE_QUEUE || ch[CH_Q_LEN] == 0 || ch[CH_Q_LEN] > 64 || ch[CH_Q_ELEM] < 16 ||
++	    ch[CH_Q_ELEM] > 64 || ch[CH_RX_REAR] >= SRAM_SIZE || ch[CH_RX_FRONT] >= SRAM_SIZE ||
++	    ch[CH_TX_REAR] >= SRAM_SIZE || ch[CH_TX_FRONT] >= SRAM_SIZE ||
++	    ch[CH_TX_BASE] + ch[CH_Q_LEN] * ch[CH_Q_ELEM] > SRAM_SIZE ||
++	    ch[CH_RX_BASE] + ch[CH_Q_LEN] * ch[CH_Q_ELEM] > SRAM_SIZE) {
++		LOG("implausible DVFS channel, stopping");
++		return;
++	}
++	LOG("dvfs queues: ap->apm rear %u front %u, apm->ap rear %u front %u", sr(ch[CH_RX_REAR]),
++	    sr(ch[CH_RX_FRONT]), sr(ch[CH_TX_REAR]), sr(ch[CH_TX_FRONT]));
++	/* continue the sequence numbers of the last request in the queue */
++	seq = (sr(ch[CH_RX_BASE] + ch[CH_Q_ELEM] * ((sr(ch[CH_RX_FRONT]) + ch[CH_Q_LEN] - 1) % ch[CH_Q_LEN])) >>
++	    SEQ_SHIFT) & 0x3f;
++
++	LOG("ACPM get: %s %u kHz", doms[0].name, get_rate(doms[0].id));
++	if (cmu_all) {
++		LOG("ACPM get: %s %u kHz, %s %u kHz", doms[1].name, get_rate(doms[1].id), doms[2].name,
++		    get_rate(doms[2].id));
++	}
++	for (int d = 0; d < 3; d++) {
++		if (want[d] == 0) {
++			if (d == 0) {
++				(void)pick_rate(&doms[0], 0);   /* log the A55 map */
++			}
++			continue;
++		}
++		uint32_t rate = pick_rate(&doms[d], want[d]);
++		if (rate == 0) {
++			LOG("%s: no level <= %u kHz, skipped", doms[d].name, want[d]);
++			continue;
++		}
++		if (d > 0) {
++			log_cmu(&doms[d], "before");
++		}
++		uint32_t cmd[4] = { doms[d].id, rate, FREQ_REQ, 0 };
++		int e = acpm_call(cmd);
++		LOG("%s -> %u kHz: %d (reply %#x %#x %#x %#x)", doms[d].name, rate, e, cmd[0], cmd[1], cmd[2], cmd[3]);
++		delay(10000);
++		log_cmu(&doms[d], "after");
++		LOG("ACPM get after: %s %u kHz", doms[d].name, get_rate(doms[d].id));
++	}
++	measure_mhz("now");
++}
++
++#else
++void
++d2s_cpufreq_start(void)
++{
++}
++#endif /* D2S */
