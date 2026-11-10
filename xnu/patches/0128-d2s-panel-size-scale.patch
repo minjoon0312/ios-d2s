@@ -128,7 +128,7 @@ diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 index c242894..3eb6f6a 100644
 --- a/pexpert/pexpert/arm64/A5XELTE.h
 +++ b/pexpert/pexpert/arm64/A5XELTE.h
-@@ -76,6 +76,14 @@
+@@ -76,6 +76,15 @@
  #define A5_BOOT_MPIDR                 0x0         /* first Cortex-A55 */
  #undef A5_KLOG_PHYS
  #define A5_KLOG_PHYS                  0xfd910000  /* d2s log_kernel zone */
