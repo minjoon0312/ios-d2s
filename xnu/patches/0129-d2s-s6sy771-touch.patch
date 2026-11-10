@@ -37,9 +37,9 @@ index 3f15f09..eb86b77 100644
 +		x = x * 1080 / 4096;
 +		y = y * 1920 / 4096;
 +	} else {
-+		int lw = s8ts_scale == 2 ? 1404 : 1125, lh = s8ts_scale == 2 ? 3040 : 2436;
-+		int px = (int)(x * 1440 / 4096) - (1440 - lw) / 2;
-+		int py = (int)(y * 3040 / 4096) - (3040 - lh) / 2;
++		int lw = s8ts_scale == 2 ? 1125 * A5_FB_HEIGHT / 2436 : 1125, lh = s8ts_scale == 2 ? A5_FB_HEIGHT : 2436;
++		int px = (int)(x * A5_FB_WIDTH / 4096) - (A5_FB_WIDTH - lw) / 2;
++		int py = (int)(y * A5_FB_HEIGHT / 4096) - (A5_FB_HEIGHT - lh) / 2;
 +		px = px < 0 ? 0 : (px > lw - 1 ? lw - 1 : px);
 +		py = py < 0 ? 0 : (py > lh - 1 ? lh - 1 : py);
 +		x = (unsigned)px * 1080 / (unsigned)lw;

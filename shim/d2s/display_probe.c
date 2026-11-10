@@ -21,7 +21,7 @@
 #define SHADOW_REQ		0x60
 #define SHADOW_GLOBAL		(1u << 31)
 #define FB_PHYS			0xcc000000u
-#define FB_STRIDE		(1440u * 4)
+#define FB_STRIDE		(1080u * 4)	/* d1x */
 #define TIMER_HZ		26000000UL
 
 static const uintptr_t idma[6] = {
