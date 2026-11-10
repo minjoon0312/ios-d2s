@@ -27,8 +27,8 @@
 
 /* ---- board facts (Galaxy Note 10+ / SM-N975F / d2s / Exynos 9825) ---- */
 #define FB_BASE			0xca000000UL	/* decon_fb@0xCA000000 */
-#define FB_W			1440
-#define FB_H			3040
+#define FB_W			1080	/* d1x S6E3FA7 */
+#define FB_H			2280
 #define FB_STRIDE		(FB_W * 4)
 #define DECON_SHADOW		0x19030060UL	/* DECON_F SHADOW_REG_UPDATE_REQ */
 #define DECON_TRIG		0x19030070UL	/* DECON_F HW_SW_TRIG_CONTROL */

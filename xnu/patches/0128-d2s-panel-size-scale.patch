@@ -56,7 +56,7 @@ index 381aa2d..437eea2 100644
 +			d2s_fb_cleared = true;
 +		}
 +	}
-+	/* rounded edges: 1125 * 1.28 = 1439.99 must reach column 1440 */
++	/* rounded edges: the last logical column must reach the panel edge */
 +	uint64_t px0 = ox + (((uint64_t)dx * kx + 0x8000) >> 16);
 +	uint64_t px1 = ox + (((uint64_t)(dx + w) * kx + 0x8000) >> 16);
 +	uint64_t py0 = oy + (((uint64_t)dy * ky + 0x8000) >> 16);
@@ -128,13 +128,19 @@ diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
 index c242894..3eb6f6a 100644
 --- a/pexpert/pexpert/arm64/A5XELTE.h
 +++ b/pexpert/pexpert/arm64/A5XELTE.h
-@@ -76,6 +76,9 @@
+@@ -76,6 +76,14 @@
  #define A5_BOOT_MPIDR                 0x0         /* first Cortex-A55 */
  #undef A5_KLOG_PHYS
  #define A5_KLOG_PHYS                  0xfd910000  /* d2s log_kernel zone */
-+/* 6.8" panel: 1440x3040, 32 bpp (A5_FB_2M_BLOCKS 9 still covers 17.5 MB). */
++/* d1x (Note 10 5G, SM-N971N): 6.3" S6E3FA7 panel 1080x2280, 32 bpp
++ * (9.8 MB; A5_FB_2M_BLOCKS 9 from the S8 still covers it). */
++#define D1X                           1
++#undef A5_FB_WIDTH
++#define A5_FB_WIDTH                   1080
 +#undef A5_FB_HEIGHT
-+#define A5_FB_HEIGHT                  3040
++#define A5_FB_HEIGHT                  2280
++#undef A5_FB_STRIDE
++#define A5_FB_STRIDE                  4320
  #define D2S_PMU_PHYS                  0x15860000  /* pmu_system_controller */
  #define D2S_DECON_PHYS                0x19030000  /* DECON_F */
  #define D2S_SD_PHYS                   0x13d00000  /* dwmmc2 (microSD) */
