@@ -1,0 +1,1473 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 84d9296..490c8f5 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/d2s_gpu.c			standard
+ bsd/dev/d2s_cpufreq.c			standard
++bsd/dev/d1x_haptics.c			standard
+ bsd/kern/d2s_files.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index e6e76d7..e341402 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1193,6 +1193,7 @@ dreamlte_touch_start(void)
+ extern void d2s_gpu_start(void);
+ extern void d2s_files_start(void);
+ extern void d2s_cpufreq_start(void);
++extern void d1x_haptics_start(void);
+ 
+ void
+ a5xelte_touch_probe(void)
+@@ -1204,6 +1205,7 @@ a5xelte_touch_probe(void)
+ 	d2s_cpufreq_start();      /* CPU clocks over ACPM, boot-arg d2scpufreq (d2s_cpufreq.c) */
+ 	d2s_gpu_start();          /* Mali-G76 core + boot self-test (d2s_gpu.c) */
+ 	d2s_files_start();        /* boot-image files into the iOS root (d2s_files.c) */
++	d1x_haptics_start();      /* CS40L25A motor, boot-arg d2shaptic, off by default (d1x_haptics.c) */
+ #endif
+ 	int enabled = A5_TOUCH_DEFAULT; /* A5 touch: off on the S8 */
+ 	int log_contacts = 0;
+diff --git a/bsd/dev/d1x_haptics.c b/bsd/dev/d1x_haptics.c
+new file mode 100644
+index 0000000..e6b2514
+--- /dev/null
++++ b/bsd/dev/d1x_haptics.c
+@@ -0,0 +1,1369 @@
++/*
++ * Galaxy Note 10 5G (d1x, SM-N971N, Exynos 9825): the vibration motor.
++ * Milestone M1 of research/AUDIO_HAPTICS_9825.md: the motor buzzes once at
++ * boot when a boot-arg asks for it. Nothing here runs unless d2shaptic >= 1.
++ *
++ * The motor is an LRA driven by a Cirrus Logic CS40L25A (DEVID 0x40A25A) at
++ * I2C address 0x40. Written from facts, no code copied:
++ *  - d1x DT (exynos9820-d1x_kor_23.dts:8243, exynos9825.dts): cs40l25@40 on
++ *    hsi2c_44 (pins gpm10-0 SCL / gpm11-0 SDA), reset-gpios gpg1-7 (high =
++ *    running; pinctrl "motor-boost-en" drives it high), interrupt gph1-0,
++ *    boost 1000 nH / 4 uF / 4000 mA, gpio1-mode 1, amp-gnd-stby. No supply
++ *    phandles: VA (1.8 V) and VP (battery) are always on, so no ACPM/S2MPS19
++ *    rail is touched here.
++ *  - Samsung's S-Boot of this phone (N971NKSU2HXJ2 sboot.bin, disassembled
++ *    offline): register_cs40l2x_vib/cs40l2x_vib_enable pulse gpg1-7 (GPIO
++ *    0x647 = bank 50 = 0x104300a0, pin 7) low 2 ms, high, wait 1 ms, then
++ *    over a GPIO bit-banged I2C ("EXT_I2C" bus 14 = GPIO 0x200 SCL / 0x220
++ *    SDA = gpm10-0 / gpm11-0) write BASIC_BUZZ_FREQ 0x0280017c = 158,
++ *    BASIC_BUZZ_LEVEL 0x02800180 = 130, BASIC_BUZZ_DURATION 0x02800184 = 25,
++ *    read each back, log "%s freq. %dHz %dVrms %dms", and buzz with
++ *    BASIC_BUZZ_TRIGGER 0x02800188 = 1, then waits 100 (its delay helper
++ *    0xd2af4; ms assumed). That is the ROM ("basic mode") buzz, run on every
++ *    cold boot: no firmware needed. Code at sboot.bin offsets 0xceb00-0xcece4
++ *    (vib), 0xc6280 (I2C write), 0xa62cc (bus 14 pins).
++ *  - Samsung's Linux driver (CruelKernel cruel-HVJ5-v5.3 drivers/motor/
++ *    cs40l2x.c, read for facts only): probe order, basic-mode exit, B0
++ *    errata, boost and routing, wmfw/wmdr block placement, DSP start.
++ *  - The phone's cs40l25a.wmfw (38224 bytes, crc32 0x90661b70, FW ID
++ *    0x1400c3 rev 8.8.1) decoded offline with tools/ah_tools/wmfw_syms.py:
++ *    the XM addresses of its controls below hold only for that exact file,
++ *    so level 3 refuses any other file.
++ *
++ * Bus: GPIO bit-bang on gpm10-0/gpm11-0, the way S-Boot talks to this chip.
++ * The HSI2C helpers of a5xelte_touch.c (patch 0130 timing) are not reused:
++ * their timing assumes the 26 MHz OSCCLK the loader sets for hsi2c_10,
++ * while I2C_CMGP2's clock mux (CMU_CMGP 0x15c0100c) picks OSCCLK_RCO_CMGP or
++ * the CMGP bus and nobody sets it up under iOS. Open drain is emulated
++ * (output-low or input), so both lines need the board's pull-ups, which the
++ * DT implies (hsi2c44-bus pin-pud 0). At the default 2 us half clock one
++ * register access takes ~0.5 ms and the whole firmware ~2 s (plus as long
++ * again to read it back); this thread spins meanwhile, sleeping 2 ms after
++ * every 240-byte burst so the boot keeps going.
++ *
++ * Boot-args:
++ *   d2shaptic=0      default: nothing at all (no MMIO, no pins touched)
++ *   d2shaptic=1      look: pins, chip as S-Boot left it, reset pulse, OTP
++ *                    boot, DEVID/REVID, ROM (basic mode) state. No drive.
++ *   d2shaptic=2      1 + the ROM buzz: S-Boot's frequency and level, for
++ *                    d2shaptic_ms (default 150, 10..300)
++ *   d2shaptic=3      1 + firmware: basic-mode exit, errata, boost, routing,
++ *                    cs40l25a.wmfw + cs40l20.bin loaded and read back, DSP
++ *                    started; one click (wave d2shaptic_idx, default 1, 0 =
++ *                    none) and one buzz of d2shaptic_ms. No ROM buzz here, so
++ *                    what is felt comes from the firmware path.
++ *   d2shaptic_level  ROM buzz level, 1..130 (S-Boot's 130 is the cap)
++ *   d2shaptic_us     I2C half period in us (default 2, 1..50)
++ *   d2shaptic_verify=0  skip the firmware read-back (halves level 3's time)
++ * Firmware for level 3: the boot image's D2SFiles blob (patch 0133) is
++ * searched for paths ending in /cs40l25a.wmfw and /cs40l20.bin; failing
++ * that, /usr/share/firmware/<name> is read once the root is mounted.
++ *
++ * Limits, whatever is asked: at most one ROM buzz or one click and one buzz
++ * per boot; a buzz is at most 300 ms, and the chip is told so itself (ROM
++ * DURATION, firmware TIMEOUT_MS), so it stops even if this thread or the
++ * kernel dies; this thread also ends it (ENDPLAYBACK) and forces the chip
++ * off (reset low) 100 ms after the expected end. Every wait is bounded. Any
++ * fault (no ACK, wrong ID, read-back mismatch, ROM or amp error bit, boost
++ * short) stops the run. At the end of every run the chip is held in reset,
++ * which also turns its boost converter off, and the I2C pins are released.
++ * Log lines start with "D1X HAPTIC:".
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h> /* rootvnode */
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <mach/mach_time.h>
++#include <machine/machine_routines.h>
++#include <libkern/crc.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++
++void d1x_haptics_start(void);
++
++#if defined(D2S)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IOSleep(unsigned int milliseconds);
++extern const void *d2s_files_find(const char *suffix, uint32_t *len);   /* d2s_files.c */
++
++#define LOG(fmt, ...)   printf("D1X HAPTIC: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- pins (exynos9825.dts; bank offsets from Samsung's exynos9820 pin tables) ---- */
++#define PERIC0_GPIO_PA  0x10430000u     /* gpg1 at +0xa0: CS40L25A RESET = gpg1-7 */
++#define PERIC1_GPIO_PA  0x10830000u     /* gph1 at +0x100: CS40L25A IRQ = gph1-0 (read only) */
++#define CMGP_GPIO_PA    0x15c30000u     /* gpm10 +0x140 = SCL, gpm11 +0x160 = SDA (1 pin each) */
++#define GPG1            0x0a0u
++#define GPH1            0x100u
++#define GPM10           0x140u
++#define GPM11           0x160u
++#define G_CON           0x0u            /* 4 bits per pin: 0 input, 1 output */
++#define G_DAT           0x4u
++#define G_PUD           0x8u
++#define RST_PIN         7u
++
++/* ---- CS40L2x control port (cs40l2x.h) ---- */
++#define HAP_ADDR        0x40u
++#define R_DEVID         0x00000000u
++#define R_REVID         0x00000004u
++#define R_FABID         0x00000008u
++#define R_RELID         0x0000000cu
++#define R_OTPID         0x00000010u
++#define R_TEST_KEY      0x00000040u
++#define R_PWR_CTRL1     0x00002014u     /* bit 0 GLOBAL_EN */
++#define R_PWR_CTRL2     0x00002018u     /* [5:4] BST_EN */
++#define R_LRCK_PAD      0x00002418u
++#define R_SDIN_PAD      0x00002420u
++#define R_PWRMGT_CTL    0x00002900u     /* bit 1 MEM_RDY */
++#define R_PLL_LOOP      0x00003008u
++#define R_PLL_MISC      0x00003014u
++#define R_BST_VCTRL1    0x00003800u     /* [7:0] VBST target */
++#define R_BST_VCTRL2    0x00003804u     /* bit 2 limit enable, [1:0] target select */
++#define R_BST_IPK       0x00003808u     /* [6:0] peak current */
++#define R_BST_COEFF     0x00003810u     /* [7:0] K1, [15:8] K2 */
++#define R_BST_SLOPE     0x00003814u     /* [15:8] slope, [1:0] inductor */
++#define R_TEST_LBST     0x0000391cu
++#define R_OTP_TRIM12    0x00004170u
++#define R_OTP_TRIM13    0x00004360u
++#define R_SPKMON_RESYNC 0x00004100u
++#define R_TEMP_RESYNC   0x00004310u
++#define R_VPVBST_FS     0x00004400u
++#define R_DAC_PCM1_SRC  0x00004c00u
++#define R_DSP1_RX1_SRC  0x00004c40u
++#define R_AMP_DIG_VOL   0x00006000u
++#define R_IRQ1_STATUS1  0x00010010u
++#define R_IRQ1_STATUS3  0x00010018u
++#define R_IRQ1_STATUS4  0x0001001cu
++#define R_IRQ2_STATUS1  0x00010814u
++#define R_IRQ2_MASK1    0x00010910u
++#define R_IRQ2_MASK2    0x00010914u
++#define R_MBOX_INDEX    0x00013020u     /* TRIGGERINDEX: play wave n */
++#define R_MBOX_MS       0x00013024u     /* TRIGGER_MS: 0 = buzz for TIMEOUT_MS */
++#define MBOX_ACKED      0xffffffffu
++#define R_DSP1_RX_RATE  0x02b80080u     /* + 8 * n, n = 0..7 */
++#define R_DSP1_TX_RATE  0x02b80280u
++#define R_DSP1_SCRATCH1 0x02b805c0u
++#define R_DSP1_CORE     0x02bc1000u     /* bit 9 RESET, bit 0 EN */
++#define R_XM_ACCEL_PRI  0x02bc2020u
++#define R_YM_ACCEL_PRI  0x02bc20e0u
++
++/* ROM ("basic mode") controls, valid right after reset (cs40l2x.h:549-574) */
++#define B_HALO_STATE    0x02800154u     /* 2 = ROM running */
++#define B_HEARTBEAT     0x02800158u
++#define B_STATE         0x0280015cu     /* 0 idle, 1 play, 2 continue, 3 shutting down, 4 shut down */
++#define B_F0_STORED     0x02800174u
++#define B_GPIO_EDGE     0x02800178u
++#define B_BUZZ_FREQ     0x0280017cu
++#define B_BUZZ_LEVEL    0x02800180u
++#define B_BUZZ_DURATION 0x02800184u
++#define B_BUZZ_TRIGGER  0x02800188u
++#define B_AMP_STATUS    0x0280018cu     /* 1 boot done, 2 OTP err, 4 amp err, 8 temp warn, 0x10 temp err */
++#define B_SHUTDOWN_REQ  0x02800190u
++
++/* S-Boot's own ROM buzz values for this phone (see the top) */
++#define SBOOT_FREQ      158u
++#define SBOOT_LEVEL     130u
++#define SBOOT_DURATION  25u
++
++/* DSP memory windows */
++#define XM_PACKED       0x02000000u
++#define XM_UNPACKED     0x02800000u
++#define YM_PACKED       0x02c00000u
++#define YM_UNPACKED     0x03400000u
++#define PM_PACKED       0x03800000u
++
++/* cs40l25a.wmfw rev 8.8.1 (FW ID 0x1400c3), addresses from tools/ah_tools/wmfw_syms.py */
++#define FW_SIZE         38224u
++#define FW_CRC          0x90661b70u
++#define FW_ID           0x1400c3u
++#define XM_FW_ID        0x0280000cu
++#define XM_FW_REV       0x02800010u
++#define S_HALO_STATE    0x028015c0u     /* 203 = running */
++#define HALO_RUN        203u
++#define S_EVENTCONTROL  0x02801704u
++#define S_ENDPLAYBACK   0x02801748u
++#define S_GPIO_BTNDET   0x02801760u
++#define S_GAIN_CONTROL  0x0280176cu
++#define S_GPIO_ENABLE   0x02801770u
++#define S_IRQMASKSEQ    0x02801928u     /* 4 x (upper, lower) */
++#define S_IRQMASKSEQ_OK 0x02801948u
++#define S_IMON_OFFS     0x02801958u
++#define S_SPK_AUTO      0x02801970u     /* SPK_FORCE_TST_1_AUTO */
++#define S_GPIO_POL      0x02801974u
++#define VG_STATUS       0x02800b50u     /* VIBEGEN (algorithm 0xbd) */
++#define VG_TIMEOUT_MS   0x02800b54u
++#define VG_NUMWAVES     0x02800b58u
++#define VG_COMP_ENABLE  0x02800b5cu
++#define VG_ALGO         0x0000bdu
++#define VG_REV          0x050602u
++#define VG_XM_BASE      0x2d3u          /* words */
++#define VG_XM_WORDS     0x271u
++#define VG_YM_BASE      0x0u
++#define VG_YM_WORDS     0x6d6u
++
++/* IRQ1/IRQ2 STATUS1 hardware errors: amp short, overtemp, temp warning,
++ * boost short, boost undervoltage, boost overvoltage */
++#define HW_ERRS         0x800281c0u
++
++#define CHUNK           240u            /* bytes per I2C burst: a multiple of 12 and 20 */
++#define MAX_MS          300u
++#define FW_MAX          (64u * 1024u)
++#define FW_DIR          "/usr/share/firmware/"
++
++static uint32_t hap_level, hap_ms = 150, hap_idx = 1, hap_rom_level = SBOOT_LEVEL;
++static uint32_t hap_half_us = 2, hap_verify = 1;
++static vm_offset_t g_peric0, g_peric1, g_cmgp;
++static bool g_pins_taken, g_reset_driven;
++static unsigned g_i2c_errs;
++
++/* ------------------------------------------------------------------------ */
++
++static uint32_t
++mrd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++mwr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++static uint32_t
++be32(const uint8_t *b)
++{
++	return (uint32_t)b[0] << 24 | (uint32_t)b[1] << 16 | (uint32_t)b[2] << 8 | b[3];
++}
++
++static uint32_t
++le32(const uint8_t *b)
++{
++	return (uint32_t)b[3] << 24 | (uint32_t)b[2] << 16 | (uint32_t)b[1] << 8 | b[0];
++}
++
++/* ---- reset pin gpg1-7 ---------------------------------------------------- */
++
++static void
++reset_drive(bool high)
++{
++	uint32_t dat = mrd(g_peric0, GPG1 + G_DAT);
++	dat = high ? (dat | (1u << RST_PIN)) : (dat & ~(1u << RST_PIN));
++	mwr(g_peric0, GPG1 + G_DAT, dat);               /* level first, then output */
++	mwr(g_peric0, GPG1 + G_CON, (mrd(g_peric0, GPG1 + G_CON) & ~(0xfu << (RST_PIN * 4))) |
++	    (1u << (RST_PIN * 4)));
++	g_reset_driven = true;
++}
++
++/* ---- I2C on gpm10-0 (SCL) / gpm11-0 (SDA), open drain emulated ----------- */
++
++static void
++pin_release(uint32_t bank)
++{
++	mwr(g_cmgp, bank + G_CON, mrd(g_cmgp, bank + G_CON) & ~0xfu);  /* input: the pull-up wins */
++}
++
++static void
++pin_low(uint32_t bank)
++{
++	mwr(g_cmgp, bank + G_CON, (mrd(g_cmgp, bank + G_CON) & ~0xfu) | 1u);  /* output, latch is 0 */
++}
++
++static bool
++pin_get(uint32_t bank)
++{
++	return (mrd(g_cmgp, bank + G_DAT) & 1u) != 0;
++}
++
++/*
++ * Busy-wait on the timebase. Not delay(): on this port cpu_idle_latency is
++ * never set, so ml_delay_should_spin() is false and delay() sleeps on a timer
++ * (osfmk/kern/clock.c _clock_delay_until_deadline_with_leeway), far too slow
++ * for a clock edge. Preemption stays enabled; I2C does not mind a slow edge.
++ */
++static uint64_t g_half_ticks, g_scl_ticks;
++
++static void
++spin_ticks(uint64_t ticks)
++{
++	uint64_t end = mach_absolute_time() + ticks;
++	while (mach_absolute_time() < end) {
++		__asm__ volatile ("yield");
++	}
++}
++
++static void
++half(void)
++{
++	spin_ticks(g_half_ticks);
++}
++
++/* SCL released; wait (2 ms at most) while the line is still low (slow rise, stretching) */
++static bool
++scl_high(void)
++{
++	pin_release(GPM10);
++	if (pin_get(GPM10)) {
++		return true;
++	}
++	uint64_t end = mach_absolute_time() + g_scl_ticks;
++	while (mach_absolute_time() < end) {
++		if (pin_get(GPM10)) {
++			return true;
++		}
++	}
++	g_i2c_errs++;
++	return false;
++}
++
++static bool
++bb_start(void)
++{
++	pin_release(GPM11);
++	half();
++	if (!scl_high()) {
++		return false;
++	}
++	half();
++	if (!pin_get(GPM11)) {
++		g_i2c_errs++;
++		return false;           /* SDA held low by someone */
++	}
++	pin_low(GPM11);                 /* START: SDA falls while SCL is high */
++	half();
++	pin_low(GPM10);
++	half();
++	return true;
++}
++
++static void
++bb_stop(void)
++{
++	pin_low(GPM11);
++	half();
++	(void)scl_high();
++	half();
++	pin_release(GPM11);             /* STOP: SDA rises while SCL is high */
++	half();
++}
++
++static bool
++bb_write(uint8_t b)
++{
++	for (int i = 7; i >= 0; i--) {
++		if ((b >> i) & 1) {
++			pin_release(GPM11);
++		} else {
++			pin_low(GPM11);
++		}
++		half();
++		if (!scl_high()) {
++			return false;
++		}
++		half();
++		pin_low(GPM10);
++	}
++	pin_release(GPM11);             /* ACK slot */
++	half();
++	if (!scl_high()) {
++		return false;
++	}
++	half();
++	bool ack = !pin_get(GPM11);
++	pin_low(GPM10);
++	half();
++	if (!ack) {
++		g_i2c_errs++;
++	}
++	return ack;
++}
++
++static bool
++bb_read(uint8_t *out, bool more)
++{
++	uint8_t b = 0;
++	pin_release(GPM11);
++	for (int i = 0; i < 8; i++) {
++		half();
++		if (!scl_high()) {
++			return false;
++		}
++		half();
++		b = (uint8_t)((b << 1) | (pin_get(GPM11) ? 1 : 0));
++		pin_low(GPM10);
++	}
++	if (more) {
++		pin_low(GPM11);         /* ACK: more bytes wanted */
++	} else {
++		pin_release(GPM11);     /* NACK: last byte */
++	}
++	half();
++	if (!scl_high()) {
++		return false;
++	}
++	half();
++	pin_low(GPM10);
++	half();
++	pin_release(GPM11);
++	*out = b;
++	return true;
++}
++
++/* Free a bus a slave holds (SDA low): up to 9 clocks, then STOP. */
++static bool
++bb_recover(void)
++{
++	pin_release(GPM11);
++	if (!scl_high()) {
++		return false;
++	}
++	for (int i = 0; i < 9 && !pin_get(GPM11); i++) {
++		pin_low(GPM10);
++		half();
++		(void)scl_high();
++		half();
++	}
++	pin_low(GPM10);
++	half();
++	pin_low(GPM11);
++	half();
++	(void)scl_high();
++	half();
++	pin_release(GPM11);
++	half();
++	return pin_get(GPM10) && pin_get(GPM11);
++}
++
++static bool
++i2c_tx(uint32_t reg, const uint8_t *data, uint32_t len)
++{
++	uint8_t hdr[5] = { (uint8_t)(HAP_ADDR << 1), (uint8_t)(reg >> 24), (uint8_t)(reg >> 16),
++		           (uint8_t)(reg >> 8), (uint8_t)reg };
++	bool ok = bb_start();
++	for (unsigned i = 0; ok && i < 5; i++) {
++		ok = bb_write(hdr[i]);
++	}
++	for (uint32_t i = 0; ok && i < len; i++) {
++		ok = bb_write(data[i]);
++	}
++	bb_stop();
++	return ok;
++}
++
++static bool
++i2c_rx(uint32_t reg, uint8_t *data, uint32_t len)
++{
++	uint8_t hdr[5] = { (uint8_t)(HAP_ADDR << 1), (uint8_t)(reg >> 24), (uint8_t)(reg >> 16),
++		           (uint8_t)(reg >> 8), (uint8_t)reg };
++	bool ok = bb_start();
++	for (unsigned i = 0; ok && i < 5; i++) {
++		ok = bb_write(hdr[i]);
++	}
++	ok = ok && bb_start() && bb_write((uint8_t)((HAP_ADDR << 1) | 1));  /* repeated START, read */
++	for (uint32_t i = 0; ok && i < len; i++) {
++		ok = bb_read(&data[i], i + 1 < len);
++	}
++	bb_stop();
++	return ok;
++}
++
++/* ---- registers: 32-bit address, 32-bit value, both big endian ------------ */
++
++static bool
++rd32n(uint32_t reg, uint32_t *v, unsigned tries)
++{
++	uint8_t b[4];
++	for (unsigned t = 0; t < tries; t++) {
++		if (i2c_rx(reg, b, 4)) {
++			*v = be32(b);
++			return true;
++		}
++		(void)bb_recover();
++	}
++	return false;
++}
++
++static bool
++rd32(uint32_t reg, uint32_t *v)
++{
++	if (rd32n(reg, v, 3)) {
++		return true;
++	}
++	LOG("read %#010x: no answer (3 tries)", reg);
++	*v = 0;
++	return false;
++}
++
++/* tries = 1 for mailboxes, where a lost final ACK must not play twice */
++static bool
++wr32n(uint32_t reg, uint32_t v, unsigned tries)
++{
++	uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v };
++	for (unsigned t = 0; t < tries; t++) {
++		if (i2c_tx(reg, b, 4)) {
++			return true;
++		}
++		(void)bb_recover();
++	}
++	LOG("write %#010x = %#x: no answer (%u tries)", reg, v, tries);
++	return false;
++}
++
++static bool
++wr32(uint32_t reg, uint32_t v)
++{
++	return wr32n(reg, v, 3);
++}
++
++/* write, read back, compare the bits in mask */
++static bool
++wr32m(uint32_t reg, uint32_t v, uint32_t mask)
++{
++	uint32_t r;
++	if (!wr32(reg, v) || !rd32(reg, &r)) {
++		return false;
++	}
++	if ((r & mask) != (v & mask)) {
++		LOG("write %#010x = %#x reads back %#x (mask %#x)", reg, v, r, mask);
++		return false;
++	}
++	return true;
++}
++
++static bool
++upd32(uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t r;
++	if (!rd32(reg, &r)) {
++		return false;
++	}
++	return wr32m(reg, (r & ~mask) | (val & mask), mask);
++}
++
++/* write once, then poll (1 ms steps, bounded) until the register reads `done` */
++static bool
++ack32(uint32_t reg, uint32_t v, uint32_t done, unsigned ms_max, unsigned *ms_taken)
++{
++	uint32_t r = 0;
++	if (!wr32n(reg, v, 1)) {
++		return false;
++	}
++	for (unsigned ms = 1; ms <= ms_max; ms++) {
++		IOSleep(1);
++		if (rd32(reg, &r) && r == done) {
++			*ms_taken = ms;
++			return true;
++		}
++	}
++	LOG("register %#010x = %#x: no acknowledgement in %u ms (reads %#x)", reg, v, ms_max, r);
++	return false;
++}
++
++static bool
++wr_block(uint32_t reg, const uint8_t *d, uint32_t len)
++{
++	for (uint32_t off = 0; off < len; off += CHUNK) {
++		uint32_t n = len - off < CHUNK ? len - off : CHUNK;
++		bool ok = false;
++		for (unsigned t = 0; t < 3 && !ok; t++) {
++			ok = i2c_tx(reg + off, d + off, n);
++			if (!ok) {
++				(void)bb_recover();
++			}
++		}
++		if (!ok) {
++			LOG("block write at %#010x: no answer", reg + off);
++			return false;
++		}
++		IOSleep(2);             /* let the boot run between bursts (this thread spins) */
++	}
++	return true;
++}
++
++/* read back; unpacked24: bits 31..24 of each word are not memory, skip them */
++static bool
++vf_block(uint32_t reg, const uint8_t *d, uint32_t len, bool unpacked24)
++{
++	uint8_t buf[CHUNK];
++	for (uint32_t off = 0; off < len; off += CHUNK) {
++		uint32_t n = len - off < CHUNK ? len - off : CHUNK;
++		bool ok = false;
++		for (unsigned t = 0; t < 3 && !ok; t++) {
++			ok = i2c_rx(reg + off, buf, n);
++			if (!ok) {
++				(void)bb_recover();
++			}
++		}
++		if (!ok) {
++			LOG("block read at %#010x: no answer", reg + off);
++			return false;
++		}
++		for (uint32_t i = 0; i < n; i++) {
++			if ((unpacked24 && (i & 3) == 0) || buf[i] == d[off + i]) {
++				continue;
++			}
++			uint32_t w = (off + i) & ~3u;
++			LOG("read-back mismatch at %#010x: wrote %#010x, reads %#010x", reg + w,
++			    be32(d + w), be32(buf + (w - off)));
++			return false;
++		}
++		IOSleep(2);
++	}
++	return true;
++}
++
++/* ---- pins, look, reset, park -------------------------------------------- */
++
++static void
++show_pin(const char *what, vm_offset_t base, uint32_t bank, unsigned pin)
++{
++	uint32_t con = mrd(base, bank + G_CON), dat = mrd(base, bank + G_DAT), pud = mrd(base, bank + G_PUD);
++	LOG("  %-22s con %x dat %u pud %x", what, (con >> (pin * 4)) & 0xf, (dat >> pin) & 1,
++	    (pud >> (pin * 4)) & 0xf);
++}
++
++static bool
++take_pins(void)
++{
++	g_peric0 = ml_io_map(PERIC0_GPIO_PA, 0x1000);
++	g_peric1 = ml_io_map(PERIC1_GPIO_PA, 0x1000);
++	g_cmgp = ml_io_map(CMGP_GPIO_PA, 0x1000);
++	if (!g_peric0 || !g_peric1 || !g_cmgp) {
++		LOG("MMIO mapping failed");
++		return false;
++	}
++	LOG("pins as found (con 0 in, 1 out, 3 = hsi2c, f = eint; pud 0 none, 1 down, 3 up):");
++	show_pin("reset gpg1-7", g_peric0, GPG1, RST_PIN);
++	show_pin("irq gph1-0 (low=pending)", g_peric1, GPH1, 0);
++	show_pin("scl gpm10-0", g_cmgp, GPM10, 0);
++	show_pin("sda gpm11-0", g_cmgp, GPM11, 0);
++	pin_release(GPM11);             /* inputs first (S-Boot may have left outputs) */
++	pin_release(GPM10);
++	mwr(g_cmgp, GPM10 + G_DAT, 0);  /* output latches 0: "output" now means low */
++	mwr(g_cmgp, GPM11 + G_DAT, 0);
++	g_pins_taken = true;
++	spin_ticks(g_half_ticks * 10);
++	bool scl = pin_get(GPM10), sda = pin_get(GPM11);
++	LOG("bus released: scl %d sda %d (both 1 = pull-ups and the 1.8 V I/O rail are there)", scl, sda);
++	if (!scl) {
++		LOG("SCL stays low: no pull-up or no power on the bus; stopping");
++		return false;
++	}
++	if (!sda && !bb_recover()) {
++		LOG("SDA stays low after 9 clocks; stopping");
++		return false;
++	}
++	return true;
++}
++
++/* At the end of every run, and on any fault: chip in reset, pins released. */
++static void
++park(const char *why)
++{
++	if (!g_peric0) {
++		return;
++	}
++	reset_drive(false);
++	if (g_pins_taken) {
++		pin_release(GPM11);
++		pin_release(GPM10);
++	}
++	LOG("%s: chip held in reset (gpg1-7 low, boost and amp off), I2C pins released; %u bus errors",
++	    why, g_i2c_errs);
++}
++
++static void
++show_rom(const char *when)
++{
++	uint32_t st = 0, halo = 0, hb = 0, sm = 0, f = 0, l = 0, d = 0, f0 = 0;
++	(void)rd32(B_AMP_STATUS, &st);
++	(void)rd32(B_HALO_STATE, &halo);
++	(void)rd32(B_HEARTBEAT, &hb);
++	(void)rd32(B_STATE, &sm);
++	(void)rd32(B_BUZZ_FREQ, &f);
++	(void)rd32(B_BUZZ_LEVEL, &l);
++	(void)rd32(B_BUZZ_DURATION, &d);
++	(void)rd32(B_F0_STORED, &f0);
++	LOG("%s: ROM amp_status %#x (1 = boot done) halo %u (2 = ROM runs) heartbeat %u state %u "
++	    "f0_stored %#x buzz freq %u level %u duration %u", when, st, halo, hb, sm, f0, f, l, d);
++}
++
++/* Reset pulse as Samsung's probe (low >= 2 ms, high, control port after 1 ms),
++ * then wait for OTP boot (IRQ1_STATUS4 bit 1) and check the part. */
++static bool
++reset_and_identify(uint32_t *revid_out)
++{
++	uint32_t s4 = 0, s3 = 0, devid = 0, revid = 0, fab = 0, rel = 0, otp = 0;
++	unsigned ms = 0;
++
++	reset_drive(false);
++	IOSleep(3);
++	reset_drive(true);
++	IOSleep(2);
++	for (ms = 2; ms <= 200; ms += 2) {
++		if (rd32n(R_IRQ1_STATUS4, &s4, 1) && (s4 & 2u)) {
++			break;
++		}
++		IOSleep(2);
++	}
++	if (!(s4 & 2u)) {
++		LOG("reset released, but no OTP boot done in 200 ms (IRQ1_STATUS4 %#x)", s4);
++		return false;
++	}
++	(void)rd32(R_IRQ1_STATUS3, &s3);
++	LOG("reset pulse done (gpg1-7 low 3 ms, high); OTP boot done after ~%u ms, IRQ1_STATUS3 %#x%s",
++	    ms, s3, (s3 & 0x80000000u) ? " OTP BOOT ERROR" : "");
++	if (!rd32(R_DEVID, &devid) || !rd32(R_REVID, &revid)) {
++		return false;
++	}
++	(void)rd32(R_FABID, &fab);
++	(void)rd32(R_RELID, &rel);
++	(void)rd32(R_OTPID, &otp);
++	LOG("DEVID %#x (CS40L25A = 0x40a25a) REVID %#x (B1 = 0xb1) FABID %#x RELID %#x OTPID %#x",
++	    devid, revid, fab, rel, otp);
++	if (s3 & 0x80000000u) {
++		return false;
++	}
++	if (devid != 0x40a25au || revid < 0xb1u) {
++		LOG("not the expected CS40L25A rev >= B1; stopping");
++		return false;
++	}
++	*revid_out = revid;
++	return true;
++}
++
++static bool
++hw_errors(const char *when)
++{
++	uint32_t s1 = 0, s2 = 0;
++	bool ok = rd32(R_IRQ1_STATUS1, &s1) && rd32(R_IRQ2_STATUS1, &s2);
++	uint32_t e = (s1 | s2) & HW_ERRS;
++	if (!ok || e) {
++		LOG("%s: IRQ1_STATUS1 %#x IRQ2_STATUS1 %#x:%s%s%s%s%s%s%s", when, s1, s2,
++		    ok ? "" : " (unreadable)",
++		    (e & 0x80000000u) ? " amp-short" : "", (e & 0x20000u) ? " overtemp" : "",
++		    (e & 0x8000u) ? " temp-warn" : "", (e & 0x100u) ? " boost-short" : "",
++		    (e & 0x80u) ? " boost-UVP" : "", (e & 0x40u) ? " boost-OVP" : "");
++		return true;
++	}
++	return false;
++}
++
++/* ---- level 2: the ROM buzz ----------------------------------------------- */
++
++static bool
++rom_buzz(void)
++{
++	uint32_t st = 0, f = 0, l = 0, d = 0, sm = 0, trig = 0;
++	/* Unit of DURATION: S-Boot's log says ms, but it waits 100 ms after a
++	 * value of 25, and the successor part's ROM buzz (CS40L26, Zephyr
++	 * cs40l26_configure_buzz) counts 4 ms steps with level 255 = 100 %.
++	 * Program ms/4: either reading is bounded (<= 300 ms), and the measured
++	 * time to idle below tells which one is right. */
++	uint32_t dur = (hap_ms + 3) / 4;
++
++	if (!rd32(B_AMP_STATUS, &st) || !(st & 1u) || (st & 0x1eu)) {
++		LOG("ROM not ready or reports an error (amp_status %#x); no buzz", st);
++		return false;
++	}
++	(void)wr32(R_IRQ1_STATUS1, HW_ERRS);    /* clear old error bits (write 1 to clear) */
++	if (!wr32m(B_BUZZ_FREQ, SBOOT_FREQ, 0xffffffu) || !wr32m(B_BUZZ_LEVEL, hap_rom_level, 0xffffffu) ||
++	    !wr32m(B_BUZZ_DURATION, dur, 0xffffffu)) {
++		return false;
++	}
++	(void)rd32(B_BUZZ_FREQ, &f);
++	(void)rd32(B_BUZZ_LEVEL, &l);
++	(void)rd32(B_BUZZ_DURATION, &d);
++	LOG("ROM buzz set: freq %u (Hz; S-Boot 158) level %u (S-Boot 130 = 51 %% if 255 = 100 %%) duration %u "
++	    "(= %u ms in 4 ms steps, %u ms if in ms; S-Boot 25)", f, l, d, d * 4, d);
++
++	uint64_t t0 = now_us(), deadline = t0 + (uint64_t)(dur * 4 + 100) * 1000;
++	if (!wr32n(B_BUZZ_TRIGGER, 1, 1)) {
++		return false;
++	}
++	uint64_t t_on = 0, t_off = 0;
++	uint32_t last = 0xffffffffu;
++	while (now_us() < deadline) {
++		if (rd32n(B_STATE, &sm, 2)) {
++			uint64_t t = now_us() - t0;
++			if (sm != last) {
++				LOG("  t=%llu ms: state %u", t / 1000, sm);
++				last = sm;
++			}
++			if (sm == 1 || sm == 2) {
++				if (!t_on) {
++					t_on = t ? t : 1;
++				}
++			} else if (sm == 0 && t_on) {
++				t_off = t;
++				break;
++			}
++			if (sm == 0 && !t_on && t > 60000) {
++				break;  /* never started */
++			}
++		}
++		IOSleep(3);
++	}
++	(void)rd32(B_BUZZ_TRIGGER, &trig);
++	if (!t_off && t_on) {
++		reset_drive(false);     /* hard stop, whatever the units are */
++		LOG("ROM buzz still on after %llu ms: forced off (reset low)", (now_us() - t0) / 1000);
++		return false;
++	}
++	if (!t_on) {
++		LOG("ROM buzz: the state machine never left idle (trigger reads %#x); no buzz", trig);
++		return false;
++	}
++	(void)rd32(B_AMP_STATUS, &st);
++	LOG("ROM buzz played: on at ~%llu ms, idle at ~%llu ms after the trigger (programmed %u x 4 ms = %u); "
++	    "trigger reads %#x, amp_status %#x", t_on / 1000, t_off / 1000, dur, dur * 4, trig, st);
++	if ((st & 0x1eu) || hw_errors("after the ROM buzz")) {
++		return false;
++	}
++	return true;
++}
++
++/* ---- level 3: firmware --------------------------------------------------- */
++
++struct fw {
++	const uint8_t *p;
++	uint32_t len;
++	void *heap;
++	uint32_t heap_len;
++};
++
++static bool
++fw_get(const char *name, struct fw *out)
++{
++	char suffix[40], path[96];
++	uint32_t len = 0;
++	const void *p;
++
++	bzero(out, sizeof(*out));
++	snprintf(suffix, sizeof(suffix), "/%s", name);
++	p = d2s_files_find(suffix, &len);
++	if (p != NULL) {
++		out->p = p;
++		out->len = len;
++		LOG("%s: %u bytes from the boot image (D2SFiles)", name, len);
++		return true;
++	}
++	snprintf(path, sizeof(path), FW_DIR "%s", name);
++	for (unsigned w = 0; rootvnode == NULLVP && w < 60000; w += 100) {
++		IOSleep(100);
++	}
++	if (rootvnode == NULLVP) {
++		LOG("%s: not in the boot image, and no root after 60 s", name);
++		return false;
++	}
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	off_t size = 0;
++	int resid = 0;
++	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (err) {
++		LOG("%s: not in the boot image, and open %s: error %d", name, path, err);
++		return false;
++	}
++	err = vnode_size(vp, &size, ctx);
++	if (!err && (size <= 0 || size > (off_t)FW_MAX)) {
++		err = EFBIG;
++	}
++	if (!err) {
++		out->heap_len = (uint32_t)size;
++		out->heap = kalloc_data(out->heap_len, Z_WAITOK);
++		if (out->heap == NULL) {
++			err = ENOMEM;
++		}
++	}
++	if (!err) {
++		err = vn_rdwr(UIO_READ, vp, (caddr_t)out->heap, (int)size, 0, UIO_SYSSPACE, IO_NODELOCKED,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!err && resid) {
++			err = EIO;
++		}
++	}
++	(void)vnode_close(vp, FREAD, ctx);
++	if (err) {
++		LOG("%s: reading %s failed: error %d", name, path, err);
++		if (out->heap) {
++			kfree_data(out->heap, out->heap_len);
++		}
++		bzero(out, sizeof(*out));
++		return false;
++	}
++	out->p = out->heap;
++	out->len = out->heap_len;
++	LOG("%s: %u bytes from %s", name, out->len, path);
++	return true;
++}
++
++static void
++fw_put(struct fw *f)
++{
++	if (f->heap) {
++		kfree_data(f->heap, f->heap_len);
++	}
++	bzero(f, sizeof(*f));
++}
++
++/* Samsung's cs40l2x_basic_mode_exit order; error bits stop the run instead
++ * of being released. */
++static bool
++basic_mode_exit(void)
++{
++	uint32_t st = 0, hb0 = 0, hb = 0, sm = 0;
++	unsigned ms = 0;
++	int i;
++
++	for (i = 0; i < 20; i++) {
++		if (rd32(B_AMP_STATUS, &st) && (st & 1u)) {
++			break;
++		}
++		IOSleep(5);
++	}
++	if (!(st & 1u)) {
++		LOG("basic mode: no boot done (amp_status %#x)", st);
++		return false;
++	}
++	(void)rd32(B_HEARTBEAT, &hb0);
++	for (i = 0; i < 20; i++) {
++		IOSleep(5);
++		if (rd32(B_HEARTBEAT, &hb) && hb > hb0) {
++			break;
++		}
++	}
++	if (hb <= hb0) {
++		LOG("basic mode: heartbeat stuck at %u", hb0);
++		return false;
++	}
++	if (!ack32(B_SHUTDOWN_REQ, 1, 0, 20, &ms) || !rd32(B_STATE, &sm) || !rd32(B_AMP_STATUS, &st)) {
++		return false;
++	}
++	LOG("basic mode exit: heartbeat %u -> %u, shutdown acknowledged after %u ms, state %u (4 = shut down), "
++	    "amp_status %#x", hb0, hb, ms, sm, st);
++	if (sm != 4 || (st & 0x1eu)) {
++		return false;
++	}
++	/* cs40l2x_basic_mode_revert; read back: GLOBAL_EN, BST_EN, pads, HPF, masks */
++	return wr32m(R_PWR_CTRL1, 0, 0x1u) && wr32m(R_PWR_CTRL2, 0x3321, 0x30u) &&
++	       wr32m(R_LRCK_PAD, 7, 0x7u) && wr32m(R_SDIN_PAD, 7, 0x7u) &&
++	       wr32m(R_AMP_DIG_VOL, 0x8000, 0x8000u) && wr32m(R_IRQ2_MASK1, 0xffffffffu, 0xffffffffu) &&
++	       wr32m(R_IRQ2_MASK2, 0xffffffffu, 0xffffffffu);
++}
++
++/* B0 errata (applies to B1+ too in Samsung's driver), boost for 1.0 uH /
++ * 4 uF / 4.0 A / 11 V, the boost short test, PCM routing. */
++static bool
++chip_init(void)
++{
++	static const uint32_t errata[][2] = {
++		{ R_PLL_LOOP, 0x000c1837 }, { R_PLL_MISC, 0x03008e0e },
++		{ R_TEST_KEY, 0x55 }, { R_TEST_KEY, 0xaa },
++		{ R_TEST_LBST, 0x004dc080 }, { R_OTP_TRIM12, 0x002f0065 }, { R_OTP_TRIM13, 0x00002b4f },
++		{ R_SPKMON_RESYNC, 0 }, { R_TEMP_RESYNC, 0 },
++		{ R_TEST_KEY, 0xcc }, { R_TEST_KEY, 0x33 },
++		{ R_VPVBST_FS, 0 },
++	};
++	static const uint32_t routing[][2] = {
++		{ R_DAC_PCM1_SRC, 0x32 },               /* amp DAC <- DSP1 TX1 */
++		{ R_DSP1_RX1_SRC, 0x08 },               /* ASPRX1 */
++		{ R_DSP1_RX1_SRC + 4, 0x18 },           /* VMON */
++		{ R_DSP1_RX1_SRC + 8, 0x19 },           /* IMON */
++		{ R_DSP1_RX1_SRC + 12, 0x28 },          /* VPMON */
++	};
++	uint32_t s1 = 0;
++
++	for (unsigned i = 0; i < sizeof(errata) / sizeof(errata[0]); i++) {
++		if (!wr32(errata[i][0], errata[i][1])) {       /* not read back, as Samsung */
++			return false;
++		}
++	}
++	/* cs40l2x_bst_k1/k2_table[0][0] = 0x24, slope_table[0] = 0x75, LBST 0;
++	 * IPK (4000 - 1600) / 50 + 0x10 = 0x40; VBST (11000 - 2550) / 50 + 1 = 0xaa */
++	if (!upd32(R_BST_COEFF, 0xffffu, 0x2424u) || !upd32(R_BST_SLOPE, 0xff03u, 0x7500u) ||
++	    !upd32(R_BST_IPK, 0x7fu, 0x40u) || !upd32(R_BST_VCTRL1, 0xffu, 0xaau) ||
++	    !upd32(R_BST_VCTRL2, 0x4u, 0x4u)) {
++		return false;
++	}
++	/* boost short test: target = control port value, chip on for 10 ms, look
++	 * for BST_SHORT_ERR, chip off again, target back to class H */
++	(void)wr32(R_IRQ1_STATUS1, HW_ERRS);
++	if (!upd32(R_BST_VCTRL2, 0x3u, 0x0u)) {
++		return false;
++	}
++	if (!upd32(R_PWR_CTRL1, 0x1u, 0x1u)) {
++		return false;   /* park() turns it off */
++	}
++	IOSleep(10);
++	bool rd_ok = rd32(R_IRQ1_STATUS1, &s1);
++	bool off_ok = upd32(R_PWR_CTRL1, 0x1u, 0x0u);
++	LOG("boost short test: IRQ1_STATUS1 %#x%s", s1, (s1 & 0x100u) ? " BOOST SHORT" : ", no short");
++	if (!rd_ok || !off_ok || (s1 & 0x100u) || !upd32(R_BST_VCTRL2, 0x3u, 0x1u)) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(routing) / sizeof(routing[0]); i++) {
++		if (!wr32m(routing[i][0], routing[i][1], 0x7fu)) {
++			return false;
++		}
++	}
++	LOG("errata, boost (1.0 uH, 4 uF, 4.0 A peak, 11 V limit) and DSP routing written");
++	return true;
++}
++
++static bool
++load_wmfw(const struct fw *f)
++{
++	const uint8_t *d = f->p;
++	uint32_t n = f->len, crc, pos, bytes = 0;
++	unsigned blocks = 0;
++	uint64_t t0 = now_us();
++
++	crc = crc32(0, d, n);
++	if (n != FW_SIZE || crc != FW_CRC) {
++		LOG("cs40l25a.wmfw is %u bytes, crc32 %#x; the addresses here are for %u bytes, crc32 %#x "
++		    "(stock N971NKSU2HXJ2 rev 8.8.1): not loading", n, crc, FW_SIZE, FW_CRC);
++		return false;
++	}
++	if (memcmp(d, "WMFW", 4) != 0 || le32(d + 4) != 40) {
++		LOG("cs40l25a.wmfw: bad header");
++		return false;
++	}
++	for (pos = 40; pos + 8 <= n;) {
++		uint32_t off = (uint32_t)d[pos] | (uint32_t)d[pos + 1] << 8 | (uint32_t)d[pos + 2] << 16;
++		uint32_t type = d[pos + 3], len = le32(d + pos + 4), reg = 0;
++		pos += 8;
++		if (len > n - pos) {
++			LOG("wmfw block at %u overruns the file", pos - 8);
++			return false;
++		}
++		switch (type) {
++		case 0x10: reg = PM_PACKED + off * 5; break;    /* 5 registers per 4 instructions */
++		case 0x11: reg = XM_PACKED + off * 3; break;    /* 3 registers per 4 words */
++		case 0x12: reg = YM_PACKED + off * 3; break;
++		case 0xf2: case 0xff: break;                    /* algorithm / file info: host side */
++		default:
++			LOG("wmfw block type %#x unexpected", type);
++			return false;
++		}
++		if (reg) {
++			if ((len & 3) || !wr_block(reg, d + pos, len) ||
++			    (hap_verify && !vf_block(reg, d + pos, len, false))) {
++				return false;
++			}
++			blocks++;
++			bytes += len;
++		}
++		pos += (len + 3) & ~3u;
++	}
++	LOG("cs40l25a.wmfw: %u memory blocks, %u bytes written%s in %llu ms", blocks, bytes,
++	    hap_verify ? " and read back" : "", (now_us() - t0) / 1000);
++	return true;
++}
++
++static bool
++load_wavetable(const struct fw *f)
++{
++	const uint8_t *d = f->p;
++	uint32_t n = f->len, pos, bytes = 0;
++	unsigned blocks = 0;
++
++	if (n < 16 || (n & 3) || memcmp(d, "WMDR", 4) != 0 || le32(d + 4) != 16) {
++		LOG("cs40l20.bin: not a WMDR file");
++		return false;
++	}
++	LOG("cs40l20.bin: crc32 %#x (stock: 0xd4074636)", crc32(0, d, n));
++	for (pos = 16; pos + 20 <= n;) {
++		uint32_t off = (uint32_t)d[pos] | (uint32_t)d[pos + 1] << 8;
++		uint32_t type = (uint32_t)d[pos + 2] | (uint32_t)d[pos + 3] << 8;
++		uint32_t algo = le32(d + pos + 4), rev = le32(d + pos + 8), len = le32(d + pos + 16);
++		pos += 20;
++		if (len > n - pos) {
++			LOG("wavetable block overruns the file");
++			return false;
++		}
++		if (type == 0xfe00 || type == 0xff00) {         /* name / info text */
++			char txt[32];
++			uint32_t k;
++			for (k = 0; k < len && k < sizeof(txt) - 1; k++) {
++				txt[k] = (d[pos + k] >= 0x20 && d[pos + k] < 0x7f) ? (char)d[pos + k] : '.';
++			}
++			txt[k] = 0;
++			LOG("cs40l20.bin: \"%s\"", txt);
++		} else if (type == 5 || type == 6) {            /* XM / YM unpacked, 24 bits per word */
++			uint32_t base = type == 5 ? XM_UNPACKED + VG_XM_BASE * 4 : YM_UNPACKED + VG_YM_BASE * 4;
++			uint32_t lim = (type == 5 ? VG_XM_WORDS : VG_YM_WORDS) * 4;
++			if (algo != VG_ALGO || ((rev >> 8) & 0xff0000u) != (VG_REV & 0xff0000u)) {
++				LOG("wavetable block for algorithm %#x rev %#x: not VIBEGEN 5.x", algo, rev);
++				return false;
++			}
++			if ((off & 3) || (len & 3) || off > lim || len > lim - off) {
++				LOG("wavetable block (offset %u, %u bytes) does not fit VIBEGEN's %s", off, len,
++				    type == 5 ? "XM" : "YM");
++				return false;
++			}
++			if (!wr_block(base + off, d + pos, len) || (hap_verify && !vf_block(base + off, d + pos, len, true))) {
++				return false;
++			}
++			blocks++;
++			bytes += len;
++		} else {
++			LOG("wavetable block type %#x unexpected", type);
++			return false;
++		}
++		pos += (len + 3) & ~3u;
++	}
++	LOG("cs40l20.bin: %u blocks, %u bytes written%s", blocks, bytes, hap_verify ? " and read back" : "");
++	return blocks > 0;
++}
++
++/* cs40l2x_dsp_pre_config with this DT (gpio1-mode 1 = off by default,
++ * amp-gnd-stby, no gpio polarity) and no IRQ handler (events off). */
++static bool
++dsp_pre_config(void)
++{
++	static const uint32_t masks[4] = { 0xffffffffu & ~HW_ERRS, 0xffffffffu, 0xffff87ffu, 0xfeffffffu };
++	if (!wr32m(S_GPIO_BTNDET, 1, 0xffffffu) || !wr32m(S_GPIO_POL, 0, 0xffffffu) ||
++	    !wr32m(S_GPIO_ENABLE, 0, 0xffffffu) || !wr32m(S_SPK_AUTO, 0x00d02800u, 0xffffffu) ||
++	    !wr32m(S_EVENTCONTROL, 0, 0xffffffu)) {
++		return false;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		if (!wr32m(S_IRQMASKSEQ + i * 8, (masks[i] & 0xffu) << 16, 0xffffffu) ||
++		    !wr32m(S_IRQMASKSEQ + i * 8 + 4, (masks[i] & 0xffffff00u) >> 8, 0xffffffu)) {
++			return false;
++		}
++	}
++	return wr32m(S_IRQMASKSEQ_OK, 1, 0xffffffu);
++}
++
++static bool
++dsp_start(uint32_t *waves)
++{
++	uint32_t core = 0, halo = 0, scratch = 0, id = 0, rev = 0, gain = 0, status = 0;
++	unsigned ms;
++
++	/* cs40l2x_dsp_errata, not read back (as Samsung) */
++	if (!wr32(R_XM_ACCEL_PRI, 0) || !wr32(R_YM_ACCEL_PRI, 0)) {
++		return false;
++	}
++	for (uint32_t i = 0; i < 8; i++) {
++		if (!wr32(R_DSP1_RX_RATE + i * 8, 1) || !wr32(R_DSP1_TX_RATE + i * 8, 1)) {
++			return false;
++		}
++	}
++	/* memory ready, then core reset + enable (RESET clears itself) */
++	if (!upd32(R_PWRMGT_CTL, 0x2u, 0x2u) || !rd32(R_DSP1_CORE, &core) ||
++	    !wr32(R_DSP1_CORE, core | (1u << 9) | 1u)) {
++		return false;
++	}
++	for (ms = 10; ms <= 200; ms += 10) {
++		IOSleep(10);
++		if (rd32(S_HALO_STATE, &halo) && halo == HALO_RUN) {
++			break;
++		}
++	}
++	(void)rd32(R_DSP1_SCRATCH1, &scratch);
++	(void)rd32(XM_FW_ID, &id);
++	(void)rd32(XM_FW_REV, &rev);
++	(void)rd32(VG_NUMWAVES, waves);
++	(void)rd32(S_GAIN_CONTROL, &gain);
++	(void)rd32(VG_STATUS, &status);
++	LOG("DSP: HALO_STATE %u (203 = running) after %u ms, SCRATCH1 %#x, FW ID %#x rev %#x, "
++	    "NUMBEROFWAVES %u, GAIN_CONTROL %#x, VIBEGEN status %#x", halo, ms, scratch, id, rev,
++	    *waves, gain, status);
++	if (halo != HALO_RUN || scratch != 0 || id != FW_ID) {
++		return false;
++	}
++	/* cs40l2x_dsp_post_config: compensation for ReDC and f0 on, IMON offset
++	 * calculation off (no closed-loop algorithm in this firmware) */
++	return wr32m(VG_COMP_ENABLE, 3, 0xffffffu) && wr32m(S_IMON_OFFS, 0, 0xffffffu);
++}
++
++static bool
++end_playback(void)
++{
++	return wr32(S_ENDPLAYBACK, 1);
++}
++
++static bool
++fw_play(uint32_t waves)
++{
++	uint32_t st = 0;
++	unsigned ack_ms = 0;
++	uint64_t t0;
++
++	(void)wr32(R_IRQ1_STATUS1, HW_ERRS);
++	if (hw_errors("before playing")) {
++		return false;
++	}
++	if (hap_idx && hap_idx < waves) {
++		(void)wr32(R_IRQ1_STATUS1, HW_ERRS);
++		t0 = now_us();
++		if (!ack32(R_MBOX_INDEX, hap_idx, MBOX_ACKED, 10, &ack_ms)) {
++			(void)end_playback();
++			return false;
++		}
++		IOSleep(200);           /* a click is tens of ms */
++		(void)end_playback();
++		IOSleep(10);
++		(void)rd32(VG_STATUS, &st);
++		LOG("click: wave %u of %u acknowledged after %u ms, ended at %llu ms, VIBEGEN status %#x",
++		    hap_idx, waves, ack_ms, (now_us() - t0) / 1000, st);
++		if (hw_errors("after the click")) {
++			return false;
++		}
++		IOSleep(500);           /* a gap, so the click and the buzz are told apart */
++	} else if (hap_idx) {
++		LOG("click: wave %u not below NUMBEROFWAVES %u; skipped", hap_idx, waves);
++	}
++	if (!hap_ms) {
++		return true;
++	}
++	(void)wr32(R_IRQ1_STATUS1, HW_ERRS);
++	if (!wr32m(VG_TIMEOUT_MS, hap_ms, 0xffffffu)) {         /* the DSP stops by itself after this */
++		return false;
++	}
++	t0 = now_us();
++	if (!ack32(R_MBOX_MS, 0, MBOX_ACKED, 10, &ack_ms)) {
++		(void)end_playback();
++		return false;
++	}
++	IOSleep(hap_ms > ack_ms ? hap_ms - ack_ms : 1);
++	bool ended = end_playback();
++	uint64_t t_end = now_us() - t0;
++	IOSleep(20);
++	(void)rd32(VG_STATUS, &st);
++	LOG("buzz: TIMEOUT_MS %u, acknowledged after %u ms, ENDPLAYBACK %s at %llu ms, VIBEGEN status %#x",
++	    hap_ms, ack_ms, ended ? "written" : "FAILED", t_end / 1000, st);
++	return ended && !hw_errors("after the buzz");
++}
++
++static bool
++firmware_path(void)
++{
++	struct fw wmfw, wt;
++	uint32_t waves = 0;
++	bool ok = false;
++
++	if (!fw_get("cs40l25a.wmfw", &wmfw)) {
++		return false;
++	}
++	if (!fw_get("cs40l20.bin", &wt)) {
++		fw_put(&wmfw);
++		return false;
++	}
++	ok = basic_mode_exit() && chip_init() && load_wmfw(&wmfw) && load_wavetable(&wt) &&
++	    dsp_pre_config() && dsp_start(&waves) && fw_play(waves);
++	fw_put(&wmfw);
++	fw_put(&wt);
++	return ok;
++}
++
++/* ------------------------------------------------------------------------ */
++
++static void
++hap_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t revid = 0, v = 0;
++	bool ok = false;
++
++	LOG("level %u (%s), bus: GPIO bit-bang gpm10-0/gpm11-0 at %u us per half clock", hap_level,
++	    hap_level == 1 ? "look, no drive" : hap_level == 2 ? "ROM buzz" : "firmware click and buzz",
++	    hap_half_us);
++	if (!take_pins()) {
++		goto out;
++	}
++	/* The chip as S-Boot left it: its reset high and the ROM loaded with
++	 * S-Boot's buzz (158 / 130 / 25) if it buzzed at power-on. One try only. */
++	if (rd32n(R_DEVID, &v, 1)) {
++		LOG("before our reset the chip answers: DEVID %#x", v);
++		show_rom("as found");
++	} else {
++		LOG("before our reset the chip does not answer (held in reset or not yet up)");
++	}
++	if (!reset_and_identify(&revid)) {
++		goto out;
++	}
++	show_rom("after reset");
++	if (hw_errors("after reset")) {
++		LOG("(error bits right after reset are reported only)");
++	}
++	if (hap_level == 1) {
++		ok = true;
++	} else if (hap_level == 2) {
++		ok = rom_buzz();
++	} else {
++		ok = firmware_path();
++	}
++out:
++	park(ok ? "done" : "stopped");
++}
++
++void
++d1x_haptics_start(void)
++{
++	thread_t th;
++
++	if (!PE_parse_boot_argn("d2shaptic", &hap_level, sizeof(hap_level)) || hap_level == 0) {
++		return;
++	}
++	if (hap_level > 3) {
++		hap_level = 3;
++	}
++	(void)PE_parse_boot_argn("d2shaptic_ms", &hap_ms, sizeof(hap_ms));
++	(void)PE_parse_boot_argn("d2shaptic_idx", &hap_idx, sizeof(hap_idx));
++	(void)PE_parse_boot_argn("d2shaptic_level", &hap_rom_level, sizeof(hap_rom_level));
++	(void)PE_parse_boot_argn("d2shaptic_us", &hap_half_us, sizeof(hap_half_us));
++	(void)PE_parse_boot_argn("d2shaptic_verify", &hap_verify, sizeof(hap_verify));
++	if (hap_ms > MAX_MS) {
++		hap_ms = MAX_MS;
++	}
++	if (hap_ms && hap_ms < 10) {
++		hap_ms = 10;
++	}
++	if (hap_level == 2 && hap_ms == 0) {
++		hap_ms = 150;
++	}
++	if (hap_rom_level == 0 || hap_rom_level > SBOOT_LEVEL) {
++		hap_rom_level = SBOOT_LEVEL;
++	}
++	if (hap_half_us == 0 || hap_half_us > 50) {
++		hap_half_us = 2;
++	}
++	nanoseconds_to_absolutetime((uint64_t)hap_half_us * NSEC_PER_USEC, &g_half_ticks);
++	nanoseconds_to_absolutetime(2 * NSEC_PER_MSEC, &g_scl_ticks);
++	if (g_half_ticks == 0) {
++		g_half_ticks = 1;
++	}
++	if (kernel_thread_start(hap_thread, NULL, &th) != KERN_SUCCESS) {
++		LOG("no thread");
++		return;
++	}
++	thread_deallocate(th);
++}
++
++#else /* !D2S */
++
++void
++d1x_haptics_start(void)
++{
++}
++
++#endif /* D2S */
+diff --git a/bsd/kern/d2s_files.c b/bsd/kern/d2s_files.c
+index 1f1103e..ea77db9 100644
+--- a/bsd/kern/d2s_files.c
++++ b/bsd/kern/d2s_files.c
+@@ -34,6 +34,7 @@
+ 
+ void d2s_files_start(void);
+ bool d2s_files_wait(uint32_t ms);
++const void *d2s_files_find(const char *suffix, uint32_t *len);
+ 
+ #if defined(D2S)
+ extern void IOSleep(unsigned int milliseconds);
+@@ -187,6 +188,42 @@ d2s_files_wait(uint32_t ms)
+ 	}
+ 	return files_state != 0;
+ }
++
++/*
++ * A file of the blob by the end of its path (e.g. "/cs40l25a.wmfw"), for
++ * kernel code that needs the bytes before (or without) the root, such as the
++ * haptics firmware (d1x_haptics.c). NULL if there is no valid blob or no such
++ * record. The data stays where the loader put it: nothing frees the range.
++ */
++const void *
++d2s_files_find(const char *suffix, uint32_t *len)
++{
++	size_t sl = strlen(suffix);
++	if (blob == NULL || blob_size < 16 || sl == 0 || memcmp(blob, "D2SFILE1", 8) != 0 ||
++	    *(const uint32_t *)(blob + 8) != 1) {
++		return NULL;
++	}
++	uint32_t count = *(const uint32_t *)(blob + 12), off = 16;
++	for (uint32_t i = 0; i < count; i++) {
++		const struct d2s_file_rec *r = (const struct d2s_file_rec *)(blob + off);
++		if (off + sizeof(*r) > blob_size || r->size < sizeof(*r) || r->size > blob_size - off ||
++		    r->path_len < 2 || sizeof(*r) + r->path_len > r->size) {
++			return NULL;
++		}
++		const char *path = (const char *)(r + 1);
++		uint32_t data_off = (uint32_t)sizeof(*r) + ((r->path_len + 7) & ~7u);
++		if (path[r->path_len - 1] != 0 || (uint64_t)data_off + r->data_len > r->size) {
++			return NULL;
++		}
++		size_t pl = r->path_len - 1;
++		if (pl >= sl && memcmp(path + pl - sl, suffix, sl) == 0) {
++			*len = r->data_len;
++			return (const uint8_t *)r + data_off;
++		}
++		off += r->size;
++	}
++	return NULL;
++}
+ #else
+ void
+ d2s_files_start(void)
+@@ -198,4 +235,10 @@ d2s_files_wait(__unused uint32_t ms)
+ {
+ 	return true;
+ }
++
++const void *
++d2s_files_find(__unused const char *suffix, __unused uint32_t *len)
++{
++	return NULL;
++}
+ #endif /* D2S */

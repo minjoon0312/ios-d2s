@@ -1,0 +1,23 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..efa9839 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,18 @@ void
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
++	/*
++	 * d1x 0150 (from ios-guacamole 0120): pp << PAGE_SHIFT is computed in 32 bits (ppnum_t), so a page
++	 * above 4 GiB (all of d1x XNU RAM, 0x900000000+) became a wrong, unmapped PA and
++	 * phystokv_range panicked (RedwoodGPU write-combined buffer, 0x1880d8000
++	 * -> 0x880d8000). Apple's parts never get here: their flush_dcache is
++	 * the __ARM_COHERENT_IO__ no-op.
++	 */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
++#else
+ 	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++#endif
+ }
+ 
+ #if CONFIG_COREDUMP

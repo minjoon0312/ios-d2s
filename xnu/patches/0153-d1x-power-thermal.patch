@@ -1,0 +1,888 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index d602c08..42ce927 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -633,7 +633,7 @@ a5touch_start_early(vm_offset_t nfc, vm_offset_t alive)
+ #if defined(D2S)
+ /* Note 10+: S6SY771 on hsi2c_10, interrupt gpa1-0 (GPA1 DAT at 0x024). */
+ #define S8TS_HSI2C_PA           D2S_TOUCH_HSI2C_PHYS
+-#define S8BAT_HSI2C_PA          0x10970000u
++#define S8BAT_HSI2C_PA          0x15d60000u     /* hsi2c_45 (USI_CMGP03): MAX77705, see 0147 below */
+ #define S8TS_ALIVE_PA           D2S_ALIVE_PHYS
+ #define S8TS_GPA1_DAT           0x24u
+ #else
+@@ -669,6 +669,21 @@ static bool s8ts_down[S8TS_FINGERS];
+ static uint16_t s8ts_x[S8TS_FINGERS], s8ts_y[S8TS_FINGERS];
+ 
+ #if defined(D2S)
++/*
++ * 0147: the battery bus of the Note 10 / 10+ (MAX77705 on hsi2c_45, d1xbat_read() below)
++ * runs from the CMGP block's clock, not the 26 MHz OSCCLK the loader gives the touch bus.
++ * s8i2c_reset() and s8i2c_msg() take its input clock and its message ending from here.
++ */
++static unsigned s8bat_clkin = 400000000u;       /* worked out in s8bat_setup() */
++static bool s8bat_rs = true;                    /* write-then-read with a repeated START */
++static unsigned s8bat_fails;
++
++static unsigned
++s8i2c_clkin(vm_offset_t bus)
++{
++	return (bus != 0 && bus == s8bat_i2c) ? s8bat_clkin : S8_I2C_CLKIN;
++}
++
+ /*
+  * Exynos 9820 HSI2C, as Samsung's 9820 i2c-exynos5.c. The SCL-high and
+  * start-hold timing fields are bit masks there, not the cycle counts of the
+@@ -677,12 +692,16 @@ static uint16_t s8ts_x[S8TS_FINGERS], s8ts_y[S8TS_FINGERS];
+  * the USI clock from OSCCLK, so at 26 MHz: div 4, SCL-high 0xf0,
+  * start-hold 0xf8. hsi2c_10 has samsung,stop-after-trans (STOP after every
+  * message) and samsung,scl-clk-stretching (wait for master state INIT).
++ * 0147: the input clock is s8i2c_clkin()'s (26 MHz for the touch bus as before); n is kept
++ * in 1..8 so that no input clock makes the masks below shift by -1.
+  */
+ static void
+ s8i2c_reset(vm_offset_t bus)
+ {
+-	unsigned div = (S8_I2C_CLKIN / (S8_I2C_SCL_HZ * 15)) & 0xff;
+-	unsigned n = (9 * (S8_I2C_CLKIN / 1000000)) / ((div + 1) * 10);
++	unsigned clk = s8i2c_clkin(bus);
++	unsigned div = (clk / (S8_I2C_SCL_HZ * 15)) & 0xff;
++	unsigned n = (9 * (clk / 1000000)) / ((div + 1) * 10);
++	n = n < 1 ? 1 : (n > 8 ? 8 : n);
+ 	a5touch_write(bus, 0x00, a5touch_read(bus, 0x00) | (1u << 31));
+ 	a5touch_write(bus, 0x00, a5touch_read(bus, 0x00) & ~(1u << 31));
+ 	a5touch_write(bus, 0x60, 0x0100ff00u | ((0xffffffffu >> (n - 1) << (n - 1)) & 0xff) << 16);
+@@ -698,16 +717,22 @@ static unsigned s8i2c_fails;
+ static bool
+ s8i2c_fail(vm_offset_t bus, unsigned why)
+ {
+-	if (++s8i2c_fails <= 8) {
+-		printf("S8 TOUCH: i2c fail %#x int %#x trans %#x fifo %#x\n", why,
++	bool bat = bus != 0 && bus == s8bat_i2c;
++	if (++*(bat ? &s8bat_fails : &s8i2c_fails) <= 8) {
++		printf("S8 %s: i2c fail %#x int %#x trans %#x fifo %#x\n", bat ? "BATTERY" : "TOUCH", why,
+ 		    a5touch_read(bus, 0x24), a5touch_read(bus, 0x50), a5touch_read(bus, 0x30));
+ 	}
+ 	return false;
+ }
+ 
+-/* One message, polled, as exynos5_i2c_xfer_msg with stop-after-trans. */
++/*
++ * One message, polled, as exynos5_i2c_xfer_msg with stop-after-trans. 0147: stop false
++ * (battery bus only) ends the message without STOP, as i2c-exynos5.c does on a bus without
++ * samsung,stop-after-trans: TRANS_DONE with the TX FIFO empty ends the write (its polling
++ * branch) and the next message starts with a repeated START.
++ */
+ static bool
+-s8i2c_msg(vm_offset_t bus, unsigned addr, bool rd, uint8_t *buf, unsigned len)
++s8i2c_msg(vm_offset_t bus, unsigned addr, bool rd, uint8_t *buf, unsigned len, bool stop)
+ {
+ 	uint32_t ctl = a5touch_read(bus, 0x00) & ~0xc0u;
+ 	uint32_t ac = a5touch_read(bus, 0x44) & ~(0xffffu | (1u << 16) | (1u << 31));
+@@ -716,7 +741,7 @@ s8i2c_msg(vm_offset_t bus, unsigned addr, bool rd, uint8_t *buf, unsigned len)
+ 	a5touch_write(bus, 0x48, a5touch_read(bus, 0x48) & ~(1u << 31));
+ 	a5touch_write(bus, 0x04, 3 | trig << 4 | trig << 16);
+ 	ctl |= rd ? 0x40u : 0x80u;
+-	ac |= (rd ? (1u << 16) : 0) | (1u << 17) | len;
++	ac |= (rd ? (1u << 16) : 0) | (stop ? (1u << 17) : 0) | len;
+ 	a5touch_write(bus, 0x24, a5touch_read(bus, 0x24));
+ 	a5touch_write(bus, 0x70, 7u << 24 | (addr & 0x7f) << 10);
+ 	a5touch_write(bus, 0x00, ctl);
+@@ -749,6 +774,9 @@ s8i2c_msg(vm_offset_t bus, unsigned addr, bool rd, uint8_t *buf, unsigned len)
+ 	if (us == 50000) {
+ 		return s8i2c_fail(bus, rd ? 0x100 | i : 3);
+ 	}
++	if (!stop) {
++		return true;    /* the master keeps the bus for the repeated START */
++	}
+ 	for (us = 0; (a5touch_read(bus, 0x50) & 0xfu) != 1; us++) {
+ 		if (us == 100000) {
+ 			return s8i2c_fail(bus, 4);
+@@ -762,8 +790,9 @@ static bool
+ s8i2c_xfer(vm_offset_t bus, unsigned addr, const uint8_t *w, unsigned wlen,
+     uint8_t *r, unsigned rlen)
+ {
+-	if ((wlen && !s8i2c_msg(bus, addr, false, __DECONST(uint8_t *, w), wlen)) ||
+-	    (rlen && !s8i2c_msg(bus, addr, true, r, rlen))) {
++	bool rs = rlen && bus == s8bat_i2c && s8bat_rs;        /* touch: STOP after every message */
++	if ((wlen && !s8i2c_msg(bus, addr, false, __DECONST(uint8_t *, w), wlen, !rs)) ||
++	    (rlen && !s8i2c_msg(bus, addr, true, r, rlen, true))) {
+ 		s8i2c_reset(bus);
+ 		return false;
+ 	}
+@@ -1087,6 +1116,200 @@ s8bat_read16(unsigned addr, uint8_t reg, uint16_t *value)
+ 	return true;
+ }
+ 
++#if defined(D2S)
++/*
++ * 0147: battery of the Note 10 5G (d1x) and Note 10+ (d2s): Maxim MAX77705 (charger, fuel
++ * gauge and USB-C controller in one) on hsi2c_45, 0x15D60000. That HSI2C is USI_CMGP03 of the
++ * CMGP block (exynos9825.dts: aliases hsi2c45 = "/hsi2c@15D60000", usi_03_cmgp =
++ * "/usi@15C22030"; hsi2c@15D60000 default-clk 200 MHz, samsung,usi-i2c-v2,
++ * samsung,scl-clk-stretching and no samsung,stop-after-trans; d1x DTS: max77705@66 and
++ * pca9468@57 on it, d1x_common.dtsi &usi_03_cmgp usi_v2_mode = "i2c"). ios-d2s commit 4675149
++ * named the bus hsi2c_12; it is hsi2c_45.
++ *
++ * Registers (Samsung drivers/battery_v2/max77705_fuelgauge.c, _charger.c and
++ * include/linux/mfd/max77705-private.h, CruelKernel cruel-HVJ5-v5.3; the same list as
++ * Scion-Project/scion-kernel drivers/power/max77705/hakios.max77705.c, APSL-2.0, which was read
++ * for it, nothing copied):
++ *   PMIC 0x66: 0x00 PMICID1 (0x05 or 0x15, mfd/max77705.c max77705_revision[]), 0x01 PMICREV
++ *   gauge 0x36, 16 bit LE: 0x00 STATUS (bit 3 no battery), 0x06 RepSOC (1/256 %), 0x09 VCELL
++ *     (78.125 uV), 0x0A Current (signed; fuelgauge,fg_resistor = 2 in the d1x DTS: 5 mOhm,
++ *     312.5 uA, positive while charging), 0x05 RepCap and 0x35 FullCapRep (1 mAh at 5 mOhm)
++ *   charger 0x69: 0xB2 CHG_INT_OK (bit 6 CHGIN_OK, bit 5 WCIN_OK), 0xB4 DETAILS_01 [3:0]
++ *     (0-2 charging, 3-4 full, 5-7 not charging, 8 off), 0xB7 CNFG_00 (bit 4 WDTEN),
++ *     0xBD CNFG_06 ([1:0] WDTCLR)
++ * Nothing on the chip is written except, opt-in, the charger watchdog kick below. Interrupt
++ * registers (0xB0 and the like) are not read: reading clears them.
++ *
++ * The bus is checked before any HSI2C register is touched, read only: CMU_CMGP 0x15C00000
++ * (cmucal-sfr.c exynos9820: PLL_CON0_MUX_CLKCMU_CMGP_BUS_USER +0x100 bit 4, MUX_CLK_USI_CMGP3
++ * +0x1020 bit 0, DIV_CLK_USI_CMGP3 +0x1824 [3:0], gates USI_CMGP3 IPCLK +0x2088, PCLK +0x208c,
++ * RSTNSYNC_CLK_CMGP_USI3 +0x205c with MANUAL bit 20 / CG_VAL bit 21, QCH +0x304c) and the USI
++ * mode word (usi_v2.c: I2C_SW_CONF = 1 << 2). A gate forced off or a USI not in I2C mode: the
++ * bus is never touched (S-Boot talks to this chip, so both should be set up). The input clock:
++ * OSCCLK_RCO_CMGP 49.152 MHz (cmucal-node.c FIXEDRATE) when a mux picks it, else at most the
++ * 400 MHz of CLKCMU_CMGP_BUS (cmucal-vclk.c) over the divider; timing for that upper bound
++ * keeps SCL at or below 400 kHz whatever the real rate (a slower clock only slows SCL).
++ * Boot-arg d1xbat_clk=HZ overrides it. As on the touch bus (patch 0130 comment), Samsung's
++ * timing fields are the 9820 masks, worked out by s8i2c_reset().
++ *
++ * Boot-args: sweetbattery (SweetBattery.cpp: 1 reads, 0 static fallback; the d1x boot image
++ * of tools/d2s_make_boot.py passes 0 today), d1xbat_clk=HZ, d1xbat_rs=0 (STOP between the
++ * register write and the read instead of a repeated START; also tried by itself if the
++ * repeated START fails), d1xbat_wdt=1 (opt-in, the one write to the charger: Samsung's
++ * max77705_chg_set_wdtmr_kick(), CNFG_06 WDTCLR = 01, the rest of CNFG_06 as read, and only
++ * while CNFG_00 reads WDTEN set; Scion's S9 notes say S-Boot leaves the watchdog on and the
++ * charger stops within minutes without the kick. Not verified on the d1x).
++ */
++#define D1XBAT_CMU_CMGP_PA      0x15c00000u
++#define D1XBAT_USI_MODE_PA      0x15c22030u
++#define D1XBAT_PMIC             0x66u
++#define D1XBAT_RCO_HZ           49152000u
++#define D1XBAT_BUS_MAX_HZ       400000000u
++static int s8bat_state;         /* 0 not tried, 1 ready, -1 refused: the bus is not touched again */
++static uint32_t s8bat_wdt;
++static unsigned s8bat_polls, s8bat_misses, s8bat_kicks;
++static int s8bat_last_ext = -1, s8bat_last_dtls = -1;
++
++static bool
++s8bat_read8(unsigned addr, uint8_t reg, uint8_t *value)
++{
++	return s8i2c_xfer(s8bat_i2c, addr, &reg, 1, value, 1);
++}
++
++static bool
++s8bat_gate_off(uint32_t v)
++{
++	return (v & (1u << 20)) && !(v & (1u << 21));  /* MANUAL set, CG_VAL clear */
++}
++
++static bool
++s8bat_setup(void)
++{
++	vm_offset_t cmu = ml_io_map(D1XBAT_CMU_CMGP_PA, 0x4000);
++	vm_offset_t usi = ml_io_map(D1XBAT_USI_MODE_PA & ~0xfffu, 0x1000);
++	uint32_t user, mux, div, ip, pclk, rst, qch, mode, clk = 0, ovr = 0, rs = 1;
++	uint8_t id = 0, rev = 0;
++	uint16_t st = 0;
++	int pass;
++
++	(void)PE_parse_boot_argn("d1xbat_clk", &ovr, sizeof(ovr));
++	(void)PE_parse_boot_argn("d1xbat_rs", &rs, sizeof(rs));
++	(void)PE_parse_boot_argn("d1xbat_wdt", &s8bat_wdt, sizeof(s8bat_wdt));
++	if (!cmu || !usi) {
++		printf("S8 BATTERY: CMU_CMGP / SYSREG_CMGP map failed\n");
++		return false;
++	}
++	user = a5touch_read(cmu, 0x100);
++	mux = a5touch_read(cmu, 0x1020);
++	div = a5touch_read(cmu, 0x1824);
++	ip = a5touch_read(cmu, 0x2088);
++	pclk = a5touch_read(cmu, 0x208c);
++	rst = a5touch_read(cmu, 0x205c);
++	qch = a5touch_read(cmu, 0x304c);
++	mode = a5touch_read(usi, D1XBAT_USI_MODE_PA & 0xfffu);
++	if (!(mux & 1u) || !(user & (1u << 4))) {
++		clk = D1XBAT_RCO_HZ / ((div & 0xfu) + 1);      /* exact */
++	} else {
++		clk = D1XBAT_BUS_MAX_HZ / ((div & 0xfu) + 1);  /* upper bound */
++	}
++	if (ovr >= 1000000u && ovr <= D1XBAT_BUS_MAX_HZ) {
++		clk = ovr;
++	}
++	printf("S8 BATTERY: hsi2c_45 CMU_CMGP bus_user %#x usi3 mux %#x div %#x gates ip %#x pclk %#x rst %#x "
++	    "qch %#x, USI mode %#x -> input %u Hz%s\n", user, mux, div, ip, pclk, rst, qch, mode, clk,
++	    ovr ? " (d1xbat_clk)" : ((mux & 1u) && (user & (1u << 4)) ? " (upper bound)" : ""));
++	if (s8bat_gate_off(ip) || s8bat_gate_off(pclk) || s8bat_gate_off(rst) || (mode & 7u) != 4u) {
++		printf("S8 BATTERY: hsi2c_45 clock gated off or USI not in I2C mode: not touched\n");
++		return false;
++	}
++	s8bat_clkin = clk;
++	s8bat_i2c = ml_io_map(S8BAT_HSI2C_PA, 0x1000);
++	if (!s8bat_i2c) {
++		return false;
++	}
++	if (a5touch_read(s8bat_i2c, 0xc4) & 1u) {       /* USI_CON: USI_RESET, i2c-exynos5.c exynos_usi_init() */
++		printf("S8 BATTERY: USI_CON %#x: USI reset held, released\n", a5touch_read(s8bat_i2c, 0xc4));
++		a5touch_write(s8bat_i2c, 0xc4, 0);
++	}
++	s8i2c_reset(s8bat_i2c);
++	for (pass = 0; pass < 2; pass++) {
++		s8bat_rs = rs != 0 && pass == 0;
++		if (s8bat_read8(D1XBAT_PMIC, 0x00, &id) && s8bat_read8(D1XBAT_PMIC, 0x01, &rev) &&
++		    s8bat_read16(S8BAT_FG, 0x00, &st)) {
++			printf("S8 BATTERY: MAX77705 PMICID1 %#x%s PMICREV %#x, gauge STATUS %#x (%s)\n", id,
++			    (id == 0x05 || id == 0x15) ? "" : " (not 0x05/0x15: unknown revision)", rev, st,
++			    s8bat_rs ? "repeated START" : "STOP between write and read");
++			return true;
++		}
++		printf("S8 BATTERY: no MAX77705 with %s (PMICID1 %#x)\n",
++		    s8bat_rs ? "repeated START" : "STOP", id);
++		if (rs == 0) {
++			break;
++		}
++	}
++	return false;
++}
++
++/* d1xbat_wdt=1: Samsung's watchdog kick, only while WDTEN is set (see above). */
++static void
++s8bat_kick(void)
++{
++	uint8_t c0 = 0, c6 = 0, w[2];
++	bool ok;
++	if (!s8bat_read8(S8BAT_CHG, 0xb7, &c0) || !s8bat_read8(S8BAT_CHG, 0xbd, &c6) || !(c0 & 0x10u)) {
++		return;
++	}
++	w[0] = 0xbd;
++	w[1] = (uint8_t)((c6 & ~0x03u) | 0x01u);
++	ok = s8i2c_xfer(s8bat_i2c, S8BAT_CHG, w, 2, NULL, 0);
++	if (s8bat_kicks++ == 0) {
++		printf("S8 BATTERY: charger watchdog: CNFG_00 %#x, CNFG_06 %#x written %#x: %s\n", c0, c6, w[1],
++		    ok ? "kicked" : "FAILED");
++	}
++}
++
++static int
++d1xbat_read(unsigned *percent, unsigned *mv, int *ma, int *external, int *charging, int *full)
++{
++	uint16_t status, soc, vcell, cur;
++	uint8_t ok = 0, dtls = 0;
++	unsigned pct, d;
++	if (s8bat_state == 0) {
++		s8bat_state = s8bat_setup() ? 1 : -1;
++	}
++	if (s8bat_state < 0) {
++		return -1;
++	}
++	if (!s8bat_read16(S8BAT_FG, 0x00, &status) || !s8bat_read16(S8BAT_FG, 0x06, &soc) ||
++	    !s8bat_read16(S8BAT_FG, 0x09, &vcell) || !s8bat_read16(S8BAT_FG, 0x0a, &cur) ||
++	    !s8bat_read8(S8BAT_CHG, 0xb2, &ok) || !s8bat_read8(S8BAT_CHG, 0xb4, &dtls)) {
++		if (++s8bat_misses <= 4 || !(s8bat_misses & 63)) {
++			printf("S8 BATTERY: MAX77705 read failed (%u)\n", s8bat_misses);
++		}
++		return -1;
++	}
++	pct = (unsigned)(soc >> 8) + ((soc & 0xffu) >= 128 ? 1 : 0);
++	d = dtls & 0x0fu;
++	*percent = pct > 100 ? 100 : pct;
++	*mv = (unsigned)((uint32_t)vcell * 78125u / 1000000u);
++	*ma = (int)((int16_t)cur) * 3125 / 10000;
++	*external = (ok & 0x60u) != 0;
++	*charging = *external && d <= 2;
++	*full = *external && (d == 3 || d == 4);
++	if (s8bat_wdt) {
++		s8bat_kick();
++	}
++	/* the first sample, every charger change, and every 10 min (SweetBattery polls every 30 s) */
++	if (s8bat_polls++ % 20 == 0 || *external != s8bat_last_ext || (int)d != s8bat_last_dtls) {
++		printf("S8 BATTERY: %u%% (RepSOC %#x) %u mV %d mA, CHG_INT_OK %#x DETAILS_01 %#x STATUS %#x%s\n",
++		    *percent, soc, *mv, *ma, ok, dtls, status, (status & 0x8u) ? " (no battery)" : "");
++		s8bat_last_ext = *external;
++		s8bat_last_dtls = (int)d;
++	}
++	return (!(status & 0x8u) && *mv >= 2800 && *mv <= 4600) ? 0 : -1;
++}
++#endif /* D2S */
++
+ /*
+  * SweetBattery (patch 0124) calls this every 30 s. 0 = valid sample.
+  * MAX77865 fuel gauge: SOCREP 0x06 in 1/256 %, VCELL 0x09 in 78.125 uV,
+@@ -1100,6 +1323,9 @@ int
+ dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full)
+ {
++#if defined(D2S)
++	return d1xbat_read(percent, mv, ma, external, charging, full);  /* MAX77705, 0147 */
++#else
+ 	uint16_t soc, vcell, cur;
+ 	uint8_t reg, ok = 0, dtls = 0;
+ 	if (!s8bat_i2c) {
+@@ -1126,6 +1352,7 @@ dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+ 	*charging = *external && dtls <= 2;
+ 	*full = *external && (dtls == 3 || dtls == 4);
+ 	return (*mv >= 2800 && *mv <= 4600) ? 0 : -1;
++#endif
+ }
+ 
+ static void
+diff --git a/bsd/dev/d2s_cpufreq.c b/bsd/dev/d2s_cpufreq.c
+index 6c21cd3..04b45e4 100644
+--- a/bsd/dev/d2s_cpufreq.c
++++ b/bsd/dev/d2s_cpufreq.c
+@@ -40,10 +40,17 @@
+  *   d2scpufreq_cmu=1    also read the CPUCL1/CPUCL2 CMUs and ask ACPM for
+  *                       their rates (those clusters may be powered down)
+  *   d2scpufreq_off=1    touch nothing
++ *
++ * 0147: d2s_cpufreq_start() then starts the thermal guard (below get_rate(), boot-args
++ * d2sthermal*): CPU temperatures every 2 s, the A55/A75 clocks raised here stepped down
++ * when hot and back up when cool.
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+@@ -433,8 +440,285 @@ get_rate(uint32_t id)
+ 	return e ? 0 : cmd[1];
+ }
+ 
+-void
+-d2s_cpufreq_start(void)
++/*
++ * 0147 thermal guard (d1x/d2s). Nothing cooled these SoCs under XNU: no TMU driver, and the
++ * APM's TMU plugin (acpm_tmu, ACPM channel 9) waits for Linux's exynos_acpm_tmu_set_init().
++ * Now that d2scpufreq raises the A55 to 1950 MHz and SMP adds cores, a kernel thread reads
++ * the CPU temperatures every 2 s and steps the clocks this file raised down by one ACPM level
++ * per 2 s at d2sthermal_hot or above, straight to the floor at d2sthermal_crit, and back up by
++ * one level per 2 s at d2sthermal_cool or below, never above what boot asked for. One log line
++ * every 30 s, one per change.
++ *
++ * TMU (CruelKernel cruel-HVJ5-v5.3 drivers/thermal/samsung/exynos_tmu.c, CONFIG_SOC_EXYNOS9820
++ * block and exynos98X0_tmu_initialize(), all_temp_show(); exynos9825.dts BIG/MID/LITTLE@10090000):
++ * one TMU at 0x10090000, sensor 4 LITTLE (sensors = <0x10>), 5 MID (<0x20>), 6-10 BIG (<0x7c0>);
++ * CONTROL 0x50 (bit 0 CORE_EN, bit 12 THERM_TRIP_EN), CURRENT_TEMP 0x84 + (sensor / 2) * 4,
++ * 9 bits at (sensor % 2) * 16; TRIMINFO(n) = n * 4: [8:0] temp_error1, [17:9] temp_error2,
++ * TRIMINFO(0) bit 23 two-point trimming. Celsius: one-point code - e1 + 25, two-point
++ * (code - e1) * (85 - 25) / (e2 - e1) + 25 (samsung,tmu_first/second_point_trim 0x19/0x55; e1 0
++ * -> samsung,tmu_efuse_value 0x37). Its PCLK gate: CMU_PERIS 0x10020000 +0x204c (cmucal-sfr.c).
++ * Samsung's own trips (exynos9825.dts thermal-zones): BIG/MID passive 83 C, LITTLE first
++ * cooling trip 76 C, "hot" 115 C, hardware trip samsung,tmu_default_trip_temp 0x73 = 115 C.
++ *
++ * Reading is read only, so d2sthermal defaults to 1. Clocks are only asked for when the TMU
++ * reads valid twice in a row (core enabled, every code non-zero, -20..125 C), and only for
++ * clusters this file raised at boot (d2scpufreq, d2scpufreq_mid; the M4 is not managed: its
++ * requests go through the HIU on Samsung's kernel). A read that goes bad holds the clocks.
++ *
++ * Boot-args: d2sthermal=0 off, 1 (default) read and act, 2 read and log only;
++ * d2sthermal_hot=C (85), d2sthermal_cool=C (75), d2sthermal_crit=C (95), d2sthermal_floor=KHZ
++ * (949000: the lowest level at or above it is the floor); d2sthermal_tmuon=1 (opt-in, a write):
++ * if S-Boot left CORE_EN clear, run exynos98X0_tmu_control()'s set-up without interrupts and
++ * without THERM_TRIP_EN, then set CORE_EN.
++ */
++#define TMU_PA          0x10090000UL
++#define PERIS_PA        0x10020000UL
++#define TMU_CONTROL     0x50
++#define TMU_CONTROL1    0x54
++#define TMU_AVG_CON     0x58
++#define TMU_TRIM0       0x5c
++#define TMU_COUNTER0    0x74
++#define TMU_COUNTER1    0x78
++#define TMU_TEMP(s)     (0x84u + ((s) / 2) * 4)
++#define TLOG(fmt, ...)  printf("D2S THERMAL: " fmt "\n", ##__VA_ARGS__)
++
++static uint32_t th_raised[2];           /* kHz asked for at boot: A55, A75 (0 = not managed) */
++static uint32_t th_cap[2];              /* kHz asked for now */
++static uint32_t th_mode = 1, th_hot = 85, th_cool = 75, th_crit = 95, th_floor = 949000;
++static volatile uint8_t *tmu;
++static int th_event;
++static LCK_GRP_DECLARE(d2s_acpm_grp, "d2s_acpm");
++static LCK_MTX_DECLARE(d2s_acpm_lock, &d2s_acpm_grp);   /* acpm_call() after boot */
++
++static const struct { const char *name; uint32_t sensors; } th_zone[3] = {
++	{ "LITTLE", 0x010 }, { "MID", 0x020 }, { "BIG", 0x7c0 },
++};
++
++static inline uint32_t tr(uint32_t o) { return *(volatile uint32_t *)(tmu + o); }
++static inline void tw(uint32_t o, uint32_t v) { *(volatile uint32_t *)(tmu + o) = v; __asm__ volatile ("dsb sy" ::: "memory"); }
++
++static int
++tmu_celsius(unsigned s, uint32_t code)
++{
++	uint32_t trim = tr(s * 4);
++	int e1 = (int)(trim & 0x1ff), e2 = (int)((trim >> 9) & 0x1ff);
++	if (e1 == 0) {
++		e1 = 0x37;
++	}
++	if ((tr(0) & (1u << 23)) && e2 > e1) {
++		return ((int)code - e1) * (85 - 25) / (e2 - e1) + 25;
++	}
++	return (int)code - e1 + 25;
++}
++
++/* LITTLE, MID, BIG (hottest sensor of each); false and *why if the TMU is off or a code is bad. */
++static bool
++tmu_read(int t[3], uint32_t *why)
++{
++	uint32_t ctl = tr(TMU_CONTROL);
++	if (!(ctl & 1u)) {
++		*why = ctl;
++		return false;
++	}
++	for (unsigned z = 0; z < 3; z++) {
++		int best = -1000;
++		for (unsigned s = 0; s < 16; s++) {
++			if (!(th_zone[z].sensors & (1u << s))) {
++				continue;
++			}
++			uint32_t code = (tr(TMU_TEMP(s)) >> ((s % 2) * 16)) & 0x1ff;
++			int c = tmu_celsius(s, code);
++			if (code == 0 || c < -20 || c > 125) {
++				*why = 0x80000000u | s << 16 | code;
++				return false;
++			}
++			best = c > best ? c : best;
++		}
++		t[z] = best;
++	}
++	return true;
++}
++
++/* d2sthermal_tmuon=1: exynos98X0_tmu_control(on) minus interrupts and THERM_TRIP_EN. */
++static void
++tmu_enable(void)
++{
++	uint32_t vref = (tr(0) >> 18) & 0x1f, slope = (tr(4) >> 18) & 0xf, avg = (tr(8) >> 18) & 7;
++	uint32_t bgri = (tr(12) >> 18) & 0xf, vreft = (tr(16) >> 18) & 0xf, vbei = (tr(20) >> 18) & 0xf;
++	uint32_t ctl = tr(TMU_CONTROL) & ~((0x1fu << 24) | (0xfu << 8) | (1u << 12) | 1u);
++	tw(TMU_CONTROL, ctl | vref << 24 | slope << 8);
++	tw(TMU_CONTROL1, tr(TMU_CONTROL1) & ~(1u << 10));      /* LPI_MODE off, NUM_PROBE as it is */
++	tw(TMU_AVG_CON, (tr(TMU_AVG_CON) & ~(7u | 1u << 4)) | (avg ? (avg | 1u << 4) : 0));
++	tw(TMU_COUNTER0, (tr(TMU_COUNTER0) & ~0xffffu) | 0x028a);
++	tw(TMU_COUNTER1, (tr(TMU_COUNTER1) & ~(0xffffu << 16)) | 0x028au << 16);
++	tw(TMU_TRIM0, (tr(TMU_TRIM0) & ~(0xfu << 20 | 0xfu << 12 | 0xfu << 8)) | bgri << 20 | vreft << 12 | vbei << 8);
++	tw(TMU_CONTROL, tr(TMU_CONTROL) | 1u);
++}
++
++/* The enabled levels of a domain at or below its DT max (fvmap, else the DT table), no log. */
++static unsigned
++dom_levels(const struct dom *d, uint32_t *out, unsigned max)
++{
++	unsigned n = 0;
++	if (fvmap_off) {
++		uint32_t h = fvmap_off + FVH_BYTES * d->id, lv = sram[h + FVH_NUM_LV];
++		uint32_t o_rv = sram[h + FVH_O_RATEVOLT] | (uint32_t)sram[h + FVH_O_RATEVOLT + 1] << 8;
++		for (uint32_t i = 0; i < lv && i < 32 && n < max && fvmap_off + o_rv + 8 * i + 8 <= SRAM_SIZE; i++) {
++			uint32_t rate = sr(fvmap_off + o_rv + 8 * i), volt = sr(fvmap_off + o_rv + 8 * i + 4);
++			if (volt && rate && rate <= d->dt_max) {
++				out[n++] = rate;
++			}
++		}
++		return n;
++	}
++	for (unsigned i = 0; i < d->nlevels && n < max; i++) {
++		out[n++] = d->levels[i];
++	}
++	return n;
++}
++
++/* dir < 0: the next level below khz; dir > 0: the next above; dir 0: the lowest. In [lo, hi]. */
++static uint32_t
++th_level(const struct dom *d, uint32_t khz, int dir, uint32_t lo, uint32_t hi)
++{
++	uint32_t lv[32], best = 0;
++	unsigned n = dom_levels(d, lv, 32);
++	for (unsigned i = 0; i < n; i++) {
++		uint32_t r = lv[i];
++		if (r < lo || r > hi) {
++			continue;
++		}
++		if (dir < 0 ? (r < khz && r > best) : ((dir > 0 ? r > khz : true) && (best == 0 || r < best))) {
++			best = r;
++		}
++	}
++	return best;
++}
++
++static void
++th_thread(void *arg, wait_result_t wr)
++{
++	int t[3] = { 0, 0, 0 };
++	unsigned tick, good = 0, bad = 0, downs = 0, ups = 0, fails = 0;
++	uint32_t why = 0;
++	(void)arg;
++	(void)wr;
++	for (tick = 0;; tick++) {
++		int s[3];
++		bool ok = tmu_read(s, &why);
++		if (ok) {
++			t[0] = s[0];
++			t[1] = s[1];
++			t[2] = s[2];
++			bad = 0;
++		} else if (bad++ % 15 == 0) {
++			TLOG("TMU read not valid (%#x): clocks held", why);
++		}
++		/* the hottest CPU zone steers both clusters (heat spreads over the die) */
++		int hot = t[0] > t[1] ? t[0] : t[1];
++		hot = t[2] > hot ? t[2] : hot;
++		good = ok ? good + 1 : 0;
++		for (unsigned d = 0; ok && good >= 2 && th_mode == 1 && d < 2; d++) {
++			uint32_t want = 0;
++			if (th_raised[d] == 0) {
++				continue;
++			}
++			if (hot >= (int)th_crit) {
++				want = th_level(&doms[d], 0, 0, th_floor, th_raised[d]);
++			} else if (hot >= (int)th_hot) {
++				want = th_level(&doms[d], th_cap[d], -1, th_floor, th_raised[d]);
++			} else if (hot <= (int)th_cool) {
++				want = th_level(&doms[d], th_cap[d], 1, th_floor, th_raised[d]);
++			}
++			if (want == 0 || want == th_cap[d] || (hot > (int)th_cool && want > th_cap[d])) {
++				continue;
++			}
++			uint32_t cmd[4] = { doms[d].id, want, FREQ_REQ, 0 };
++			lck_mtx_lock(&d2s_acpm_lock);
++			int e = acpm_call(cmd);
++			lck_mtx_unlock(&d2s_acpm_lock);
++			if (e == 0) {
++				TLOG("%d C: %s %u -> %u kHz", hot, doms[d].name, th_cap[d], want);
++				if (want < th_cap[d]) {
++					downs++;
++				} else {
++					ups++;
++				}
++				th_cap[d] = want;
++			} else if (fails++ < 8) {
++				TLOG("%d C: %s -> %u kHz: ACPM error %d, held at %u kHz", hot, doms[d].name, want, e, th_cap[d]);
++			}
++		}
++		if (tick % 15 == 0) {
++			TLOG("LITTLE %d C, MID %d C, BIG %d C%s; A55 %u kHz (max %u), A75 %u kHz (max %u); %u down, %u up",
++			    t[0], t[1], t[2], ok ? "" : " (last valid)", th_cap[0], th_raised[0], th_cap[1], th_raised[1],
++			    downs, ups);
++		}
++		uint64_t deadline;
++		clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&th_event, THREAD_UNINT, deadline);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++static void
++d2s_thermal_start(void)
++{
++	volatile uint8_t *peris;
++	uint32_t gate, on = 0, why = 0;
++	int t[3] = { 0, 0, 0 };
++	thread_t th;
++
++	PE_parse_boot_argn("d2sthermal", &th_mode, sizeof(th_mode));
++	if (th_mode == 0) {
++		TLOG("off (d2sthermal=0)");
++		return;
++	}
++	PE_parse_boot_argn("d2sthermal_hot", &th_hot, sizeof(th_hot));
++	PE_parse_boot_argn("d2sthermal_cool", &th_cool, sizeof(th_cool));
++	PE_parse_boot_argn("d2sthermal_crit", &th_crit, sizeof(th_crit));
++	PE_parse_boot_argn("d2sthermal_floor", &th_floor, sizeof(th_floor));
++	PE_parse_boot_argn("d2sthermal_tmuon", &on, sizeof(on));
++	if (th_cool >= th_hot || th_hot > th_crit || th_crit > 110 || th_hot < 50) {
++		TLOG("thresholds cool %u hot %u crit %u out of order: 75/85/95 used", th_cool, th_hot, th_crit);
++		th_cool = 75;
++		th_hot = 85;
++		th_crit = 95;
++	}
++	peris = (volatile uint8_t *)ml_io_map(PERIS_PA, 0x4000);
++	tmu = (volatile uint8_t *)ml_io_map(TMU_PA, 0x1000);
++	if (!peris || !tmu) {
++		TLOG("map failed");
++		return;
++	}
++	gate = *(volatile uint32_t *)(peris + 0x204c);
++	if ((gate & (1u << 20)) && !(gate & (1u << 21))) {
++		TLOG("TMU_TOP PCLK gated off (%#x): TMU not read", gate);
++		return;
++	}
++	if (!(tr(TMU_CONTROL) & 1u) && on) {
++		TLOG("CONTROL %#x: TMU core off, enabling it (d2sthermal_tmuon=1)", tr(TMU_CONTROL));
++		tmu_enable();
++		delay(10000);
++	}
++	for (unsigned d = 0; d < 2; d++) {
++		th_cap[d] = th_raised[d];
++	}
++	bool ok = tmu_read(t, &why);
++	TLOG("mode %u, cool %u hot %u crit %u C, floor %u kHz; TMU gate %#x CONTROL %#x (core %u trip %u) TRIMINFO0 %#x "
++	    "(%s-point); %s: LITTLE %d MID %d BIG %d C; managing A55 %s, A75 %s", th_mode, th_cool, th_hot, th_crit,
++	    th_floor, gate, tr(TMU_CONTROL), tr(TMU_CONTROL) & 1u, (tr(TMU_CONTROL) >> 12) & 1u, tr(0),
++	    (tr(0) & (1u << 23)) ? "two" : "one", ok ? "valid" : "not valid", t[0], t[1], t[2],
++	    th_raised[0] ? "yes" : "no", th_raised[1] ? "yes" : "no");
++	if (kernel_thread_start(th_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		TLOG("thread start failed");
++	}
++}
++
++static void
++d2s_cpufreq_boot(void)
+ {
+ 	static bool done;
+ 	uint32_t want[3] = { 0, 0, 0 }, cmu_all = 0, off = 0;
+@@ -520,6 +804,9 @@ d2s_cpufreq_start(void)
+ 		uint32_t cmd[4] = { doms[d].id, rate, FREQ_REQ, 0 };
+ 		int e = acpm_call(cmd);
+ 		LOG("%s -> %u kHz: %d (reply %#x %#x %#x %#x)", doms[d].name, rate, e, cmd[0], cmd[1], cmd[2], cmd[3]);
++		if (e == 0 && d < 2) {
++			th_raised[d] = rate;    /* 0147: the thermal guard's ceiling for this cluster */
++		}
+ 		delay(10000);
+ 		log_cmu(&doms[d], "after");
+ 		LOG("ACPM get after: %s %u kHz", doms[d].name, get_rate(doms[d].id));
+@@ -527,6 +814,18 @@ d2s_cpufreq_start(void)
+ 	measure_mhz("now");
+ }
+ 
++void
++d2s_cpufreq_start(void)
++{
++	static bool started;
++	if (started) {
++		return;
++	}
++	started = true;
++	d2s_cpufreq_boot();
++	d2s_thermal_start();    /* 0147: its own thread, after every boot-time ACPM call */
++}
++
+ #else
+ void
+ d2s_cpufreq_start(void)
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 0535b28..4babfee 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -13,12 +13,19 @@
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+-/* Galaxy S8: MAX77865 fuel gauge (bsd/dev/a5xelte_touch.c). */
++#include <pexpert/arm64/board_config.h>
++/* Galaxy S8: MAX77865 fuel gauge; Note 10 / 10+: MAX77705 (0147), both in bsd/dev/a5xelte_touch.c. */
+ extern "C" int dreamlte_battery_read(unsigned *percent, unsigned *mv, int *ma,
+     int *external, int *charging, int *full);
+ static inline int sweet_spmi_init(void) { return -1; }
+ static inline int sweet_spmi_read(unsigned, unsigned, uint8_t *) { return -1; }
++#if defined(D1X)
++#define SWEET_BAT_MAH 3500u     /* Note 10 5G (SM-N971N), 3500 mAh */
++#elif defined(D2S)
++#define SWEET_BAT_MAH 4300u     /* Note 10+ (SM-N975F), 4300 mAh */
++#else
+ #define SWEET_BAT_MAH 3000u
++#endif
+ #else
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+@@ -219,8 +226,24 @@ SweetBattery::poll(void)
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	unsigned pct = 0, s8mv = 0;
+ 	int s8ma = 0, ext = 0, chg = 0, full = 0;
++	/* 0147: up to 4 failed polls (2 min) in a row repeat the last real sample instead of
++	 * flipping iOS to the 100% fallback and back on one bus hiccup. */
++	static unsigned lastPct, lastMv, misses;
++	static int lastMa, lastExt, lastChg, lastFull;
++	static bool haveLast;
+ 	if (fReal && dreamlte_battery_read(&pct, &s8mv, &s8ma, &ext, &chg, &full) == 0) {
++		haveLast = true;
++		misses = 0;
++		lastPct = pct;
++		lastMv = s8mv;
++		lastMa = s8ma;
++		lastExt = ext;
++		lastChg = chg;
++		lastFull = full;
+ 		publish(full ? 100 : pct, s8mv, s8ma, ext != 0, ext != 0, chg != 0, full != 0, true, true);
++	} else if (fReal && haveLast && ++misses <= 4) {
++		publish(lastFull ? 100 : lastPct, lastMv, lastMa, lastExt != 0, lastExt != 0, lastChg != 0,
++		    lastFull != 0, true, true);
+ 	} else {
+ 		publish(100, 4200, 0, true, true, false, true, false, false);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4fb261e..17fbaf1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -60,7 +60,11 @@ static uint32_t d2s_fb_log = 3;         /* d2sfb_log: bit 0 stats every 10 s, bi
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
++#if defined(D2S)
++static void d2s_hzprobe(void *, wait_result_t);        /* 0147, after d2s_decon_end() */
++#endif
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -264,6 +268,12 @@ AppleCLCD::start(IOService *provider)
+ 	IOLog("SWEET FB: 0141 mask %u spin %u dirty %u vsync %u Hz %s, flush every %u, log %u\n",
+ 	    d2s_fb_mask, d2s_fb_spin, d2s_fb_dirty, fVsyncTied ? vhz : 60U,
+ 	    fVsyncTied ? "tied" : "fixed", fFlushTicks, d2s_fb_log);
++	uint32_t hzprobe = 1;           /* 0147: d2sfb_hzprobe, read only, its own thread */
++	PE_parse_boot_argn("d2sfb_hzprobe", &hzprobe, sizeof(hzprobe));
++	thread_t probe;
++	if (hzprobe != 0 && kernel_thread_start(&d2s_hzprobe, NULL, &probe) == KERN_SUCCESS) {
++		thread_deallocate(probe);
++	}
+ #endif
+ 	fPresentLock = IOLockAlloc();
+ 	if (fPresentLock == NULL) {
+@@ -564,6 +574,138 @@ d2s_decon_end(void)
+ 	*d2s_decon_reg(DECON_SHADOW_REG_UPDATE_REQ) |= DECON_SHADOW_UPDATE_ALL_WIN | DECON_SHADOW_UPDATE_GLOBAL;
+ 	d2s_decon_trigger(true);
+ }
++
++/*
++ * 0147 d2sfb_hzprobe (default 1, 0 off): the panel's real update rate, logged once about 5 s
++ * after AppleCLCD starts, from a thread of its own. READ ONLY: no DECON or CMU register is
++ * written (the frame-done pending bit is not counted: that needs a write-1-to-clear).
++ *
++ * Why: the Galaxy S7 port (wardevsa/ios-a5xelte, branch herolte) found its panel at 20 Hz
++ * because the display clock was left on the 26 MHz oscillator. Here the S6E3FA7 runs in
++ * command mode: every TE starts a DECON fetch and DSI transfer of the whole frame, so a slow
++ * DPU clock shows as a long busy time per frame and fewer frames than TEs.
++ *
++ * Over 1 s (CruelKernel cruel-HVJ5-v5.3 dpu20/cal_9820/regs-decon.h):
++ *   GLOBAL_CONTROL 0x000 bit 5 IDLE_STATUS sampled every ~100 us (IODelay is a timer sleep on
++ *     this port, see 0141 above): each busy -> idle edge is a frame done, the busy stretch is
++ *     the fetch + transfer time (about 12.8 ms at 60 Hz). A DECON busy nearly all the time
++ *     with short idle gaps can be undercounted: the busy share is printed too;
++ *   FRAME_COUNT 0x2a0 and HW_TE_CNT 0x078 (HW_TRIG_CNT_A [15:0], _B [31:16]): read before and
++ *     after, printed as they are (Samsung's driver never reads them; meaning unverified);
++ *   HW_SW_TRIG_CONTROL 0x070: HW_TRIG_EN bit 0, MASK_DECON bit 4, HW_TRIG_SKIP [23:16] (a
++ *     TE skip count divides the rate).
++ * The DPU clock (cal-if/exynos9820 cmucal-sfr.c, cmucal-node.c): CMU_DPU 0x19000000
++ *   PLL_CON0_MUX_CLKCMU_DPU_BUS_USER +0x100 bit 4 (0 = OSCCLK_DPU 26 MHz, the S7 case;
++ *   1 = CLKCMU_DPU_BUS of CMU_TOP), DIV_CLK_DPU_BUSP +0x1800; CMU_TOP 0x1a240000:
++ *   CLKCMU_DPU_BUS +0x1000 bit 0 (0 DIV_CLKCMU_DPU, 1 DIV_CLKCMU_DPU_BUS), MUX_CLKCMU_DPU_BUS
++ *   +0x1040 [1:0] (PLL_SHARED3, PLL_SHARED4, PLL_SHARED1/3, PLL_SHARED2/2), DIV_CLKCMU_DPU_BUS
++ *   +0x18c4 [3:0], gate +0x2054; MUX_CLKCMU_DPU +0x103c bit 0 (PLL_SHARED0/3, /4),
++ *   DIV_CLKCMU_DPU +0x18c0 [2:0], gate +0x2050; PLL_SHARED0..4 CON0 +0x160 + 0x20 n (ENABLE
++ *   31, M [25:16], P [13:8], S [2:0], 26 MHz in). The DPU MHz assumes the nominal /3 and /2
++ *   and MUX_PLL_SHAREDn on the PLLs: an estimate, printed with the raw registers.
++ */
++#define DECON_RUN_STATUS                (1u << 4)       /* regs-decon.h:100 */
++#define DECON_OPERATION_MODE_CMD        (1u << 8)       /* :97 */
++#define DECON_HW_TE_CNT                 0x078           /* :170 */
++#define DECON_FRAME_COUNT               0x2a0           /* :374 */
++#define D2S_CMU_DPU_PHYS                0x19000000      /* cmucal-sfr.c SFR_BLOCK(CMU_DPU) */
++#define D2S_CMU_TOP_PHYS                0x1a240000      /* SFR_BLOCK(CMU_CMU) */
++
++static uint32_t
++d2s_pll_mhz(uint32_t con0)
++{
++	uint32_t m = (con0 >> 16) & 0x3ff, p = (con0 >> 8) & 0x3f, s = con0 & 7;
++	if (!(con0 & (1u << 31))) {
++		return 26;
++	}
++	return p ? (uint32_t)(26ULL * m / ((uint64_t)p << s)) : 0;
++}
++
++static uint32_t
++d2s_rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static void
++d2s_hzprobe(void *, wait_result_t)
++{
++	vm_offset_t decon = ml_io_map(D2S_DECON_PHYS, 0x1000);
++	vm_offset_t dpu = ml_io_map(D2S_CMU_DPU_PHYS, 0x2000);
++	vm_offset_t top = ml_io_map(D2S_CMU_TOP_PHYS, 0x3000);
++	uint64_t t0, now, prev, win, busyStart = 0, busySum = 0, busyMax = 0, busyAll = 0, ns = 0, avgNs = 0, maxNs = 0, allNs = 0;
++	uint32_t edges = 0, busyN = 0, samples = 0, fc0, fc1, te0, te1, gc, trig, sh[5], mhz, src;
++	bool idle;
++
++	IOSleep(5000);
++	if (decon == 0 || dpu == 0 || top == 0) {
++		IOLog("SWEET FB: hz probe: map failed\n");
++		return;
++	}
++	gc = d2s_rd(decon, DECON_GLOBAL_CONTROL);
++	trig = d2s_rd(decon, DECON_HW_SW_TRIG_CONTROL);
++	nanoseconds_to_absolutetime(1000000000ULL, &win);
++	fc0 = d2s_rd(decon, DECON_FRAME_COUNT);
++	te0 = d2s_rd(decon, DECON_HW_TE_CNT);
++	idle = (d2s_rd(decon, DECON_GLOBAL_CONTROL) & DECON_IDLE_STATUS) != 0;
++	t0 = prev = now = mach_absolute_time();
++	while (now - t0 < win) {
++		IODelay(100);
++		now = mach_absolute_time();
++		bool i = (d2s_rd(decon, DECON_GLOBAL_CONTROL) & DECON_IDLE_STATUS) != 0;
++		samples++;
++		if (!i) {
++			busyAll += now - prev;
++		}
++		if (idle && !i) {
++			busyStart = now;
++		} else if (!idle && i) {
++			edges++;
++			if (busyStart != 0) {
++				busySum += now - busyStart;
++				busyMax = now - busyStart > busyMax ? now - busyStart : busyMax;
++				busyN++;
++			}
++		}
++		idle = i;
++		prev = now;
++	}
++	fc1 = d2s_rd(decon, DECON_FRAME_COUNT);
++	te1 = d2s_rd(decon, DECON_HW_TE_CNT);
++	absolutetime_to_nanoseconds(now - t0, &ns);
++	absolutetime_to_nanoseconds(busyN ? busySum / busyN : 0, &avgNs);
++	absolutetime_to_nanoseconds(busyMax, &maxNs);
++	absolutetime_to_nanoseconds(busyAll, &allNs);
++	IOLog("SWEET FB: hz probe: %u frame-done edges in %llu ms = %llu.%llu Hz (%u samples; busy avg %llu us, max %llu us, "
++	    "busy %llu%% of the time); FRAME_COUNT %#x -> %#x, HW_TE_CNT %#x -> %#x; control %#x (run %u, command mode %u), "
++	    "trigger %#x (hw %u, masked %u, TE skip %u)\n", edges, ns / 1000000,
++	    ns ? (uint64_t)edges * 1000000000ULL / ns : 0, ns ? ((uint64_t)edges * 10000000000ULL / ns) % 10 : 0, samples,
++	    avgNs / 1000, maxNs / 1000, ns ? allNs * 100 / ns : 0, fc0, fc1, te0, te1, gc, (gc & DECON_RUN_STATUS) != 0,
++	    (gc & DECON_OPERATION_MODE_CMD) != 0, trig, trig & DECON_HW_TRIG_EN, (trig & DECON_HW_TRIG_MASK_DECON) != 0,
++	    (trig >> 16) & 0xff);
++
++	uint32_t user = d2s_rd(dpu, 0x100), busp = d2s_rd(dpu, 0x1800);
++	uint32_t sel = d2s_rd(top, 0x1000), mbus = d2s_rd(top, 0x1040), dbus = d2s_rd(top, 0x18c4);
++	uint32_t mdpu = d2s_rd(top, 0x103c), ddpu = d2s_rd(top, 0x18c0);
++	for (unsigned n = 0; n < 5; n++) {
++		sh[n] = d2s_pll_mhz(d2s_rd(top, 0x160 + 0x20 * n));
++	}
++	if (!(user & (1u << 4))) {
++		mhz = 26;
++	} else if (sel & 1u) {
++		const uint32_t from[4] = { sh[3], sh[4], sh[1] / 3, sh[2] / 2 };
++		src = from[mbus & 3u];
++		mhz = src / ((dbus & 0xfu) + 1);
++	} else {
++		src = (mdpu & 1u) ? sh[0] / 4 : sh[0] / 3;
++		mhz = src / ((ddpu & 7u) + 1);
++	}
++	IOLog("SWEET FB: DPU clock: BUS_USER %#x (%s), BUSP div %#x; CMU_TOP CLKCMU_DPU_BUS %#x mux %#x div %#x gate %#x, "
++	    "CLKCMU_DPU mux %#x div %#x gate %#x; PLL_SHARED0-4 %u %u %u %u %u MHz; DPU bus ~%u MHz (estimate)%s\n",
++	    user, (user & (1u << 4)) ? "CMU_TOP" : "OSCCLK 26 MHz", busp, sel, mbus, dbus, d2s_rd(top, 0x2054), mdpu, ddpu,
++	    d2s_rd(top, 0x2050), sh[0], sh[1], sh[2], sh[3], sh[4], mhz,
++	    mhz < 100 ? ": slow DPU clock, as the S7's 20 Hz panel" : "");
++}
+ #endif /* D2S */
+ #endif /* DREAMLTE */
+ 

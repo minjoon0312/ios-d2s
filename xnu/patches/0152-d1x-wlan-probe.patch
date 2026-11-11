@@ -1,0 +1,1550 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 490c8f5..e0bcecd 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/d2s_wlan.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index e341402..d602c08 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1190,6 +1190,7 @@ dreamlte_touch_start(void)
+ }
+ #endif /* DREAMLTE */
+ 
++extern void d2s_wlan_start(void);
+ extern void d2s_gpu_start(void);
+ extern void d2s_files_start(void);
+ extern void d2s_cpufreq_start(void);
+@@ -1202,6 +1203,7 @@ a5xelte_touch_probe(void)
+ 	dreamlte_touch_start();   /* the A5 path below stays off */
+ #endif
+ #if defined(D2S)
++	d2s_wlan_start();         /* Wi-Fi PCIe probe, boot-arg d2swlan: own thread, after the root mount (d2s_wlan.c) */
+ 	d2s_cpufreq_start();      /* CPU clocks over ACPM, boot-arg d2scpufreq (d2s_cpufreq.c) */
+ 	d2s_gpu_start();          /* Mali-G76 core + boot self-test (d2s_gpu.c) */
+ 	d2s_files_start();        /* boot-image files into the iOS root (d2s_files.c) */
+diff --git a/bsd/dev/d2s_wlan.c b/bsd/dev/d2s_wlan.c
+new file mode 100644
+index 0000000..b369823
+--- /dev/null
++++ b/bsd/dev/d2s_wlan.c
+@@ -0,0 +1,1512 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++ *
++ * Galaxy Note 10 5G (d1x, SM-N971N, Exynos 9825): Wi-Fi milestones 1 and 2
++ * of research/WIFI_9825.md. The Broadcom BCM4375 B1 is the only endpoint of
++ * PCIe channel 0, Samsung's "host-v0" controller (pcie0@13ED0000: a
++ * DesignWare core, Samsung's ELBI glue, a one-lane Gen2 PHY and its PCS), all
++ * in FSYS1, the block that also carries the UFS the root file system is on.
++ * The Note 10+ (d2s) has the same Wi-Fi wiring per the research; untested.
++ *
++ * Boot-args. Without d2swlan nothing happens at all (no mapping, no thread):
++ *   d2swlan=1           M1, read only: the PCIe clocks (CMU_TOP mux/div/gate,
++ *                       CMU_FSYS1 user mux, gates, Q-channels), the PMU PHY
++ *                       isolation, the PCIe sysreg, the SysMMU, the pins
++ *                       (WLAN_REG_ON gpg0-5, PERST# gpf2-2, CLKREQ# gpf2-0,
++ *                       host-wake gpa0-7: function, level, pull), ELBI with
++ *                       the LTSSM state, and PHY/PCS/DBI only where Samsung's
++ *                       driver would read them (see "Safety")
++ *   d2swlan=2           M1, then M2 d2swlan_wait seconds later: REG_ON low
++ *                       20 ms, high, 200 ms; PCIe clocks on; PHY isolation
++ *                       off; PHY power-down clear; Samsung's 9820 ch0 PHY
++ *                       tables; root port (x1, target Gen1); PERST# released;
++ *                       LTSSM until L0 (10 tries); iATU; the endpoint's
++ *                       vendor/device (14e4:4475) and BAR sizes; BAR0 at
++ *                       0x14000000 and ChipCommon's chip id (0x4375, rev 5 =
++ *                       B1) through the BAR0 window. Then everything off
++ *                       again: PME_Turn_Off, PERST# low, LTSSM off, PHY
++ *                       power-down, sysreg/PMU/clocks back to what S-Boot
++ *                       left, REG_ON low. Then the DMA pool check.
++ *   d2swlan_wait=S      M2 starts S s after the root is mounted (default 15:
++ *                       the persistent log has the M1 lines by then; 0..600)
++ *   d2swlan_umux=0      M2 leaves CMU_FSYS1's PCIe user mux alone (default 1:
++ *                       switch it from OSCCLK to CLKCMU_FSYS1_PCIE if S-Boot
++ *                       left OSCCLK, as y2sios/z3s do on the 990)
++ *   d2swlan_pool=PA     the Wi-Fi DMA pool (default 0x99000000, 32 MiB,
++ *   d2swlan_pool_size=N inside Android's camera ION carve-out, which this
++ *                       port does not use; the display work takes 0x9B000000
++ *                       upward). N=0: no pool. Only inside the first low DRAM
++ *                       bank and outside the carve-outs listed at pool_avoid.
++ *   d2swlan_pooltest=B  1: map the pool uncached and run its read-back test
++ *                       (default 1 with d2swlan=2, 0 with d2swlan=1). Until a
++ *                       boot logs "pool PASS" the region is an assumption.
++ *
++ * Safety (FSYS1 also carries the UFS root):
++ *  - Started from a5xelte_touch_probe() next to the other D2S starters, but
++ *    the thread touches nothing until the root file system is mounted
++ *    (rootvnode set), so UFS is up and the root mount can never wait on it.
++ *  - Nothing belonging to UFS is read or written: CMU_FSYS1 is mapped only up
++ *    to 0x3068 (the UFS Q-channels start there) and may only be written at
++ *    the PCIe user mux and the seven PCIe gates (fsys1_wr_ok); the FSYS1 pin
++ *    mapping covers bank gpf2 only (gpf3 holds the UFS reset). PCIe channel 1
++ *    (the 5G modem on d1x) is never touched.
++ *  - Every access is checked against its block's mapping (and read-only
++ *    flag); a refused access is logged and ends M2 with the power-off.
++ *  - A block is read only when its clock is not forced off (MANUAL set, CG_VAL
++ *    clear) and, for PHY/PCS, the PMU does not isolate the PHY; the DBI of a
++ *    link that is down only with RX electrical idle ignored, as Samsung does
++ *    (M2 only; M1 reads the DBI only with the link up).
++ *  - Every wait is bounded by mach_absolute_time(); a watchdog thread logs a
++ *    step that makes no progress for 5 s (with the last register accessed)
++ *    and asks for the power-off when M2 runs over 30 s. An MMIO access that
++ *    never completes cannot be bounded: each step logs before it starts.
++ *  - Any failure in M2 runs the power-off, which puts back exactly what M2
++ *    changed.
++ *
++ * Sources (CruelKernel/samsung-exynos9820 branch cruel-HVJ5-v5.3 unless said),
++ * cited [tag]line:
++ *   [rc]   drivers/pci/dwc/pcie-exynos-host-v0.c   [hdr] pcie-exynos-host-v0.h
++ *   [cal]  drivers/pci/dwc/pci-exynos9820_cal.c (PHY, ch0, 26 MHz)
++ *   [dwh]  drivers/pci/dwc/pcie-designware-host.c  [dwc] pcie-designware.c
++ *   [cmu]  drivers/soc/samsung/cal-if/exynos9820/cmucal-sfr.c
++ *   [pin]  drivers/pinctrl/samsung/pinctrl-exynos-arm64.c
++ *   [dhd]  drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_custom_exynos.c
++ *   [dt]   research/cruel/exynos9825.dts   [d1x] exynos9820-d1x_common.dtsi
++ *   [y2s]  stormtroopxyz/y2sios kernel/xnu/files/bsd/dev/redwood_exynos_pcie.c
++ *          (structure: look/train/history/stop, bounded waits) and
++ *          redwood_bcm4375.c / docs/hardware.md (BAR0 window, chip id, rev 5).
++ *          MIT License, Copyright (c) 2026 the y2sios contributors.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>         /* rootvnode */
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <vm/memory_types.h>            /* VM_WIMG_WCOMB */
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++#include <libkern/libkern.h>
++
++void d2s_wlan_start(void);
++int d2s_wlan_pool(uint64_t *pa, vm_offset_t *va, uint32_t *size);
++
++#if defined(D2S)
++
++/* Not exported to BSD code by the headers; same approach as d2s_cpufreq.c. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern void IOSleep(unsigned int milliseconds);
++
++#define LOG(fmt, ...)   printf("D2S WLAN: " fmt "\n", ##__VA_ARGS__)
++#define N(a)            ((unsigned)(sizeof(a) / sizeof((a)[0])))
++
++/* ------------------------------------------------------------------------ */
++/* Where things are                                                          */
++
++/* pcie0@13ED0000 reg, reg-names, ranges ([dt]9223-9256) */
++#define ELBI_PA         0x13ed0000UL
++#define PHY_PA          0x13ef0000UL
++#define SYSREG_PA       0x13c11044UL    /* 0x10 bytes; +0xc = PCIE_WIFI0_PCIE_PHY_CONTROL [hdr]291 */
++#define DBI_PA          0x13f00000UL
++#define PCS_PA          0x13ee0000UL    /* 0x1fc bytes */
++#define CFG_PA          0x14ffe000UL    /* 0x2000; CFG0 is its first half [dwh]299-302 */
++#define MEM_PA          0x14000000UL    /* 32-bit memory, PCI address = CPU address */
++#define MEM_SIZE        0x00ff0000UL
++#define SHARE_PA        0x13c10700UL    /* sysreg FSYS1 + PCIE_SYSREG_SHARABILITY_CTRL [hdr]298 */
++#define PMU_PHY_PA      0x1586071cUL    /* PMU + PCIE_PHY_CONTROL (ch0) [hdr]223, [rc]2488 */
++#define SYSMMU_PA       0x13c20000UL    /* sysmmu@13C20000, PCIe ch0 [dt]9199 */
++#define TOP_MUX_PA      0x1a241070UL    /* CMU_TOP CLK_CON_MUX_MUX_CLKCMU_FSYS1_PCIE [cmu]135 */
++#define TOP_DIV_PA      0x1a24185cUL    /* CLK_CON_DIV_CLKCMU_FSYS1_PCIE [cmu]1889 */
++#define TOP_GATE_PA     0x1a242078UL    /* CLK_CON_GAT_GATE_CLKCMU_FSYS1_PCIE [cmu]746 */
++#define FSYS1_PA        0x13c00000UL    /* CMU_FSYS1 [cmu]11 */
++#define FSYS1_SIZE      0x3068U         /* QCH_CON_UFS_CARD_QCH is at 0x3068: never mapped */
++#define PERIC0_GPIO_GATE_PA 0x10402018UL /* CMU_PERIC0 GPIO_PERIC0 PCLK gate [cmu]1651 */
++#define GPF2_PA         0x13c40020UL    /* pinctrl FSYS1, bank gpf2 at 0x20 [pin]641 */
++#define GPG0_PA         0x10430080UL    /* pinctrl PERIC0, bank gpg0 at 0x80 [pin]651 */
++#define GPA0_PA         0x15850000UL    /* pinctrl ALIVE, bank gpa0 at 0 [pin]580 */
++
++/* Pin banks: CON 4 bits, DAT 1 bit, PUD 4 bits, DRV 4 bits per pin [pin]52-55 */
++#define BANK_CON        0x0U
++#define BANK_DAT        0x4U
++#define BANK_PUD        0x8U
++#define BANK_DRV        0xcU
++#define PIN_REG_ON      5U      /* gpg0-5 WLAN_EN [d1x]787; cfg_wlanen: func 1, pud 0, drv 3 [dt]1262 */
++#define PIN_PERST       2U      /* gpf2-2 [dt]9225 gpios; pcie0_perst: func 1, drv 3 [dt]1155 */
++#define PIN_CLKREQ      0U      /* gpf2-0 pcie0_clkreq: func 2, pud 3 (up), drv 3 [dt]1132 */
++#define PIN_HOST_WAKE   7U      /* gpa0-7 [d1x]788; wlan_host_wake: func 0xf, pud 1 [dt]81 */
++
++/* ELBI, Samsung's glue [hdr]123-216, 340-342 */
++#define ELBI_IRQ_PULSE          0x000U
++#define  IRQ_RADM_PM_TO_ACK     (1U << 18)
++#define ELBI_IRQ_EN_PULSE       0x00cU
++#define ELBI_SW_WAKE            0x018U  /* bit 1 set: bus number (config TLPs) disabled */
++#define ELBI_LTSSM_EN           0x02cU
++#define ELBI_APP_REQ_EXIT_L1    0x040U
++#define ELBI_XMIT_PME_TURNOFF   0x04cU
++#define ELBI_RDLH_LINKUP        0x074U  /* [4:0] LTSSM state, 0x11 = L0 */
++#define ELBI_PM_DSTATE          0x088U
++#define ELBI_APP_REQ_EXIT_L1_MODE 0x0f4U /* bit 0 L1 exit by hardware, bit 4 L1 NAK */
++#define ELBI_HISTORY(i)         (0x138U + 4U * (i))
++#define ELBI_LINKDOWN_RST_SEL   0x1b8U
++#define ELBI_SOFT_AUXCLK        0x1c4U
++#define ELBI_SOFT_CORE_RESET    0x1d0U
++#define ELBI_HISTORY_CHECK      0x274U
++#define ELBI_PCS_G_RST          0x288U
++#define ELBI_CMN_RST            0x28cU
++#define ELBI_MAC_RST            0x290U
++#define ELBI_STATE_POWER_S      0x2bcU
++#define ELBI_STATE_POWER_M      0x2c0U
++#define ELBI_QCH_SEL            0x2c8U
++#define ELBI_L12ERR_CTRL        0x2f0U  /* bit 2 NCLK_OFF: 0 while the DBI is used [rc]49-56 */
++
++/* PCS and PHY [cal] */
++#define PCS_L1SS_CTRL           0x00cU
++#define PCS_CDR                 0x0d0U
++#define PCS_ELECIDLE            0x0ecU  /* bit 3: ignore RX electrical idle (ch0) [cal]35-39 */
++#define PCS_TX_LATENCY          0x0f8U
++#define PCS_REFCLK_OUT          0x100U  /* bit 6: power down [cal]78-80 */
++#define PCS_104                 0x104U  /* bit 7: power down [cal]82-84 */
++#define PHY_CMN_PWRDN           (0x20U * 4U)    /* 0xc0 on, 0xc1 down [cal]75, 123 */
++#define PHY_TRSV_PWRDN          (0x57U * 4U)    /* 0x7e on, 0xfe down [cal]72, 126 */
++
++/* DBI: the root port's configuration space and DesignWare port logic [hdr]227-282 */
++#define DBI_ID                  0x000U
++#define DBI_CMD                 0x004U
++#define DBI_CLASS               0x008U
++#define DBI_BAR0                0x010U
++#define DBI_BAR1                0x014U
++#define DBI_BUSES               0x018U
++#define DBI_MEM_WIN             0x020U
++#define DBI_INTPIN              0x03cU
++#define DBI_PMCSR               0x044U  /* PM capability at 0x40 */
++#define DBI_LNKCAP              0x07cU  /* PCIe capability at 0x70 */
++#define DBI_LNKCTL              0x080U  /* LNKSTA in [31:16] */
++#define DBI_LNKCTL2             0x0a0U
++#define DBI_PORT_LINK           0x710U
++#define DBI_WIDTH_SPEED         0x80cU
++#define DBI_MISC                0x8bcU  /* bit 0: DBI_RO_WR_EN */
++#define DBI_ATU_VIEWPORT        0x900U
++#define DBI_ATU_CR1             0x904U
++#define DBI_ATU_CR2             0x908U
++#define DBI_ATU_BASE            0x90cU
++#define DBI_ATU_UBASE           0x910U
++#define DBI_ATU_LIMIT           0x914U
++#define DBI_ATU_TARGET          0x918U
++#define DBI_ATU_UTARGET         0x91cU
++#define DBI_AUX_CLK             0xb40U
++#define DBI_L1SUB               0xb44U
++#define ATU_ENABLE              (1U << 31)
++#define ATU_TYPE_MEM            0U
++#define ATU_TYPE_CFG0           4U
++
++/* CMU fields [cmu]3202-3204, 4561-4563, 5746-5748 */
++#define GATE_MANUAL             (1U << 20)
++#define GATE_CG_VAL             (1U << 21)
++#define GATE_HWACG              (1U << 28)      /* ENABLE_AUTOMATIC_CLKGATING */
++#define UMUX_OFF                0x140U          /* PLL_CON0_MUX_CLKCMU_FSYS1_PCIE_USER [cmu]235 */
++#define UMUX_SEL                (1U << 4)       /* 0 OSCCLK, 1 CLKCMU_FSYS1_PCIE */
++#define UMUX_BUSY               (1U << 7)
++
++/* The endpoint: Broadcom's PCIe core config register and the backplane ([y2s] redwood_bcm4375.c 70-74) */
++#define EP_BAR0_WINDOW          0x80U
++#define SI_ENUM_BASE            0x18000000U     /* ChipCommon */
++
++#define LINK_TRIES              10U             /* Samsung tries 10 times [rc]1300 */
++#define LINK_POLL_US            50000U          /* per try; Samsung 2000 x 10 us [rc]1284-1293, [hdr]16 */
++#define WD_STALL_S              5U
++#define WD_BUDGET_S             30U
++
++/* ------------------------------------------------------------------------ */
++/* Register blocks                                                           */
++
++struct blk {
++	const char              *name;
++	uint64_t                pa;
++	uint32_t                size;           /* bytes that may be accessed from pa */
++	bool                    ro;             /* never written */
++	const uint16_t          *wr_ok;         /* if set: the only offsets that may be written */
++	unsigned                n_wr_ok;
++	volatile uint8_t        *va;
++};
++
++/* CMU_FSYS1 writes: the PCIe user mux and the PCIe gates ([cmu]1126-1155); IA (0x2048) is left alone */
++static const uint16_t fsys1_wr_ok[] = { UMUX_OFF, 0x2000, 0x2030, 0x2034, 0x2038, 0x203c, 0x2040, 0x2044 };
++
++static struct blk b_elbi = { .name = "elbi", .pa = ELBI_PA, .size = 0x1000 };
++static struct blk b_phy = { .name = "phy", .pa = PHY_PA, .size = 0x200 };
++static struct blk b_pcs = { .name = "pcs", .pa = PCS_PA, .size = 0x1fc };
++static struct blk b_dbi = { .name = "dbi", .pa = DBI_PA, .size = 0x1000 };
++static struct blk b_sysreg = { .name = "sysreg", .pa = SYSREG_PA, .size = 0x10 };
++static struct blk b_share = { .name = "sysreg_share", .pa = SHARE_PA, .size = 4, .ro = true };
++static struct blk b_pmu = { .name = "pmu_phy", .pa = PMU_PHY_PA, .size = 4 };
++static struct blk b_mmu = { .name = "sysmmu", .pa = SYSMMU_PA, .size = 0x40, .ro = true };
++static struct blk b_top_mux = { .name = "top_mux", .pa = TOP_MUX_PA, .size = 4, .ro = true };
++static struct blk b_top_div = { .name = "top_div", .pa = TOP_DIV_PA, .size = 4, .ro = true };
++static struct blk b_top_gate = { .name = "top_gate", .pa = TOP_GATE_PA, .size = 4 };
++static struct blk b_fsys1 = { .name = "cmu_fsys1", .pa = FSYS1_PA, .size = FSYS1_SIZE,
++	                      .wr_ok = fsys1_wr_ok, .n_wr_ok = N(fsys1_wr_ok) };
++static struct blk b_peric0_gate = { .name = "peric0_gpio_gate", .pa = PERIC0_GPIO_GATE_PA, .size = 4, .ro = true };
++static struct blk b_gpf2 = { .name = "gpf2", .pa = GPF2_PA, .size = 0x10 };
++static struct blk b_gpg0 = { .name = "gpg0", .pa = GPG0_PA, .size = 0x10 };
++static struct blk b_gpa0 = { .name = "gpa0", .pa = GPA0_PA, .size = 0x10, .ro = true };
++static struct blk b_cfg = { .name = "cfg", .pa = CFG_PA, .size = 0x1000 };
++static struct blk b_bar0 = { .name = "bar0", .pa = MEM_PA, .size = 0x1000 };
++
++static struct blk *const m1_blocks[] = { &b_elbi, &b_phy, &b_pcs, &b_dbi, &b_sysreg, &b_share, &b_pmu, &b_mmu,
++	                                 &b_top_mux, &b_top_div, &b_top_gate, &b_fsys1, &b_peric0_gate, &b_gpf2,
++	                                 &b_gpg0, &b_gpa0 };
++
++/* PCIe ch0 gates M2 forces on, as y2sios does for the 990 ([cmu]1126, 1139-1143, 1150) */
++static const struct {
++	uint16_t        off;
++	const char      *name;
++} pcie_gates[] = {
++	{ 0x2000, "phy_refclk" }, { 0x2030, "dbi" }, { 0x2034, "phy_apb" }, { 0x2038, "mstr" },
++	{ 0x203c, "elbi" }, { 0x2040, "pcs_apb" }, { 0x2044, "slv" },
++};
++#define GATE_GPIO_FSYS1         0x201cU         /* [cmu]1130 */
++#define GATE_SYSMMU_FSYS1       0x2080U         /* [cmu]1148 */
++#define GATE_SYSREG_FSYS1       0x2084U         /* [cmu]1129 */
++#define GATE_ELBI               0x203cU
++#define GATE_DBI                0x2030U
++#define GATE_PHY_APB            0x2034U
++#define GATE_PCS_APB            0x2040U
++
++/* What M1 logs of each block */
++static const uint16_t fsys1_regs[] = { 0x140, 0x148, 0x201c, 0x2000, 0x2030, 0x2034, 0x2038, 0x203c, 0x2040,
++	                               0x2044, 0x2048, 0x2080, 0x2084 };
++static const uint16_t fsys1_qch[] = { 0x3000, 0x3024, 0x3034, 0x3038, 0x303c, 0x3040, 0x3044, 0x3048, 0x3060,
++	                              0x3064 };
++static const uint16_t elbi_regs[] = { 0x000, 0x00c, 0x018, 0x02c, 0x074, 0x088, 0x0f4, 0x1b8, 0x1c4, 0x1d0,
++	                              0x274, 0x288, 0x28c, 0x290, 0x2c8, 0x2f0 };
++static const uint16_t phy_regs[] = { 0x000, 0x004, 0x040, 0x080, 0x0bc, 0x0c0, 0x0d8, 0x15c, 0x1fc };
++static const uint16_t pcs_regs[] = { 0x00c, 0x0d0, 0x0ec, 0x0f8, 0x100, 0x104, 0x150, 0x154 };
++static const uint16_t dbi_regs[] = { 0x000, 0x004, 0x008, 0x018, 0x020, 0x07c, 0x080, 0x0a0, 0x710, 0x80c,
++	                             0x8bc, 0x8d0, 0x900 };
++static const uint16_t sysreg_regs[] = { 0x0, 0x4, 0x8, 0xc };
++static const uint16_t mmu_regs[] = { 0x000, 0x004, 0x008, 0x034 };      /* CTRL, CFG, STATUS, VERSION (SysMMU v7 layout, unverified) */
++static const uint16_t bank_regs[] = { BANK_CON, BANK_DAT, BANK_PUD, BANK_DRV };
++
++/*
++ * The PHY's register file for ch0, 26 MHz reference, "Ch0 HS1 Gen2": 48 common bytes at PHY + 4 * i and
++ * 80 transceiver bytes at PHY + 4 * (0x30 + i), exactly [cal]181-200. Samsung's d1x defconfig has no
++ * CONFIG_EXYNOS_OTP, so no OTP tuning follows them ([cal]299-302).
++ */
++static const uint8_t phy_cmn[48] = {
++	0x01, 0xE1, 0x05, 0x00, 0x88, 0x88, 0x88, 0x0C,
++	0x61, 0x45, 0x65, 0x24, 0x33, 0x18, 0xE3, 0xFC,
++	0xD8, 0x05, 0xE6, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0x60, 0x11, 0x00, 0xA0, 0x05, 0x04, 0x18, 0x88,
++	0xC0, 0xFF, 0x9B, 0x52, 0x22, 0x30, 0x4F, 0xDC,
++	0x40, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x80,
++};
++static const uint8_t phy_trsv[80] = {
++	0x31, 0x40, 0x37, 0x99, 0x85, 0x00, 0xC0, 0xFF,
++	0xFF, 0x3F, 0x8C, 0xC8, 0x02, 0x01, 0x88, 0x80,
++	0x06, 0x90, 0x6C, 0x66, 0x09, 0x61, 0x42, 0x44,
++	0xC6, 0x50, 0x0A, 0x33, 0x58, 0xE7, 0x20, 0x22,
++	0x80, 0x38, 0x05, 0x85, 0x00, 0x00, 0x00, 0x7E,
++	0x00, 0x00, 0x55, 0x15, 0xAC, 0xAA, 0x3E, 0x00,
++	0x00, 0x00, 0x20, 0x3F, 0x00, 0x03, 0x01, 0x00,
++	0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
++	0x05, 0x85, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++/* DesignWare LTSSM states, for the log */
++static const char *const ltssm_names[] = {
++	"DETECT_QUIET", "DETECT_ACT", "POLL_ACTIVE", "POLL_COMPLIANCE", "POLL_CONFIG", "PRE_DETECT_QUIET",
++	"DETECT_WAIT", "CFG_LINKWD_START", "CFG_LINKWD_ACEPT", "CFG_LANENUM_WAI", "CFG_LANENUM_ACEPT",
++	"CFG_COMPLETE", "CFG_IDLE", "RCVRY_LOCK", "RCVRY_SPEED", "RCVRY_RCVRCFG", "RCVRY_IDLE", "L0", "L0S",
++	"L123_SEND_EIDLE", "L1_IDLE", "L2_IDLE",
++};
++
++/* ------------------------------------------------------------------------ */
++/* State                                                                     */
++
++static uint32_t wl_level;
++static const char *volatile wl_step = "start";
++static const char *volatile wl_last_name = "-";
++static volatile uint32_t wl_last_off;
++static volatile uint64_t wl_beat;               /* mach_absolute_time() of the last step change */
++static volatile uint64_t wl_m2_start;
++static volatile bool wl_active;                 /* M1/M2 hardware work in progress (watchdog stall check) */
++static volatile bool wl_m2;                     /* M2 under the watchdog's budget */
++static volatile bool wl_abort;                  /* set by the watchdog: finish with the power-off */
++static volatile bool wl_bug;                    /* an access was refused: M2 stops at the next check */
++static volatile bool wl_bug_seen;               /* ever refused: no further steps after the power-off */
++static volatile bool wl_done;
++
++/* What M2 changed, so that the power-off puts back exactly that */
++static struct {
++	bool            pins, reg_on, clocks, umux, pmu, sysreg, phy, link, atu;
++	uint32_t        gpf2[4], gpg0[4];       /* CON DAT PUD DRV as found */
++	uint32_t        top_gate, umux_val, gate[N(pcie_gates)];
++	uint32_t        pmu_phy;
++	uint32_t        sysreg0, sysreg_c;
++} sv;
++
++/* ------------------------------------------------------------------------ */
++/* Access                                                                    */
++
++static bool
++access_ok(struct blk *b, uint32_t off, bool write)
++{
++	if (b->va != NULL && (off & 3U) == 0 && b->size >= 4 && off <= b->size - 4 && !(write && b->ro)) {
++		if (!write || b->wr_ok == NULL) {
++			return true;
++		}
++		for (unsigned i = 0; i < b->n_wr_ok; i++) {
++			if (b->wr_ok[i] == off) {
++				return true;
++			}
++		}
++	}
++	if (!wl_bug) {
++		LOG("BUG: %s %s+%#x refused (%s, %#x bytes mapped); stopping at the next check",
++		    write ? "write" : "read", b->name, off, b->va == NULL ? "not mapped" : b->ro ? "read-only" : "outside",
++		    b->size);
++	}
++	wl_bug = true;
++	wl_bug_seen = true;
++	return false;
++}
++
++static uint32_t
++rd(struct blk *b, uint32_t off)
++{
++	if (!access_ok(b, off, false)) {
++		return 0xffffffffU;
++	}
++	wl_last_name = b->name;
++	wl_last_off = off;
++	return *(volatile uint32_t *)((uintptr_t)b->va + off);
++}
++
++static void
++wr(struct blk *b, uint32_t off, uint32_t value)
++{
++	if (!access_ok(b, off, true)) {
++		return;
++	}
++	wl_last_name = b->name;
++	wl_last_off = off;
++	*(volatile uint32_t *)((uintptr_t)b->va + off) = value;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void
++set_clr(struct blk *b, uint32_t off, uint32_t clear, uint32_t set)
++{
++	wr(b, off, (rd(b, off) & ~clear) | set);
++}
++
++static bool
++map_blk(struct blk *b)
++{
++	if (b->va == NULL) {
++		b->va = (volatile uint8_t *)ml_io_map((vm_offset_t)b->pa, b->size);
++	}
++	if (b->va == NULL) {
++		LOG("%s at %#llx: not mapped", b->name, b->pa);
++		return false;
++	}
++	return true;
++}
++
++/* One line for a block: the registers, and whether it answers at all ([y2s]258-274). */
++static void
++dump(const char *label, struct blk *b, const uint16_t *offs, unsigned n)
++{
++	char line[400];
++	size_t at;
++	uint32_t v, any = 0, all = ~0U;
++
++	at = (size_t)snprintf(line, sizeof(line), "%s %s(%llx)", label, b->name, b->pa);
++	for (unsigned i = 0; i < n && at < sizeof(line); i++) {
++		v = rd(b, offs[i]);
++		any |= v;
++		all &= v;
++		at += (size_t)snprintf(line + at, sizeof(line) - at, " %x=%08x", (unsigned)offs[i], v);
++	}
++	LOG("%s%s", line, any == 0 ? "  [all zero]" : all == ~0U ? "  [all ones: no answer]" : "");
++}
++
++/* ------------------------------------------------------------------------ */
++/* Time, steps, watchdog                                                     */
++
++static uint64_t
++us_to_abs(uint64_t us)
++{
++	uint64_t t;
++
++	nanoseconds_to_absolutetime(us * 1000ULL, &t);
++	return t;
++}
++
++static uint64_t
++abs_to_us(uint64_t t)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(t, &ns);
++	return ns / 1000ULL;
++}
++
++/* delay() blocks on a timer on this board (no idle latency set, sweet_ufs.c); short waits spin. */
++static void
++spin_us(uint32_t us)
++{
++	uint64_t end = mach_absolute_time() + us_to_abs(us);
++
++	while (mach_absolute_time() < end) {
++		__builtin_arm_yield();
++	}
++}
++
++static bool
++stop_now(void)
++{
++	return wl_abort || wl_bug;
++}
++
++static void
++step(const char *name)
++{
++	wl_step = name;
++	wl_beat = mach_absolute_time();
++	LOG("-- %s", name);
++}
++
++/* Wait (spinning) until (reg & mask) == want, at most us; true if it got there. */
++static bool
++wait_bits(struct blk *b, uint32_t off, uint32_t mask, uint32_t want, uint32_t us)
++{
++	uint64_t end = mach_absolute_time() + us_to_abs(us);
++
++	for (;;) {
++		if ((rd(b, off) & mask) == want) {
++			return true;
++		}
++		if (mach_absolute_time() > end || stop_now()) {
++			return false;
++		}
++		spin_us(5);
++	}
++}
++
++static void
++wlan_watchdog(__unused void *arg, __unused wait_result_t wres)
++{
++	const char *reported = NULL, *st;
++	uint64_t now;
++
++	for (unsigned s = 0; s < 1800 && !wl_done; s++) {      /* gives up after 30 min */
++		IOSleep(1000);
++		if (wl_done) {
++			break;
++		}
++		now = mach_absolute_time();
++		st = wl_step;
++		if (wl_m2 && !wl_abort && abs_to_us(now - wl_m2_start) > WD_BUDGET_S * 1000000ULL) {
++			wl_abort = true;
++			LOG("watchdog: M2 over its %u s budget in step %s: power-off at the next check", WD_BUDGET_S, st);
++		}
++		if (wl_active && st != reported && abs_to_us(now - wl_beat) > WD_STALL_S * 1000000ULL) {
++			LOG("watchdog: step %s has not moved for %llu s; last register %s+%#x", st,
++			    abs_to_us(now - wl_beat) / 1000000ULL, wl_last_name, wl_last_off);
++			reported = st;
++		}
++	}
++}
++
++/* ------------------------------------------------------------------------ */
++/* Pins, gates                                                               */
++
++static uint32_t
++pin_field(struct blk *b, uint32_t reg, uint32_t pin)
++{
++	return (rd(b, reg) >> (pin * 4U)) & 0xfU;
++}
++
++static void
++pin_set_field(struct blk *b, uint32_t reg, uint32_t pin, uint32_t value)
++{
++	set_clr(b, reg, 0xfU << (pin * 4U), (value & 0xfU) << (pin * 4U));
++}
++
++static uint32_t
++pin_dat(struct blk *b, uint32_t pin)
++{
++	return (rd(b, BANK_DAT) >> pin) & 1U;
++}
++
++/* The level first, then the function: an output never shows a stale level ([y2s]301-307). */
++static void
++pin_out(struct blk *b, uint32_t pin, uint32_t level)
++{
++	set_clr(b, BANK_DAT, 1U << pin, (level & 1U) << pin);
++	pin_set_field(b, BANK_CON, pin, 1);
++}
++
++static bool
++gate_forced_off(uint32_t v)
++{
++	return (v & GATE_MANUAL) && !(v & GATE_CG_VAL);
++}
++
++static uint32_t
++ltssm(void)
++{
++	return rd(&b_elbi, ELBI_RDLH_LINKUP) & 0x1fU;
++}
++
++static const char *
++ltssm_name(uint32_t s)
++{
++	return s < N(ltssm_names) ? ltssm_names[s] : "?";
++}
++
++static bool
++ltssm_up(uint32_t s)
++{
++	return s >= 0x0d && s <= 0x14;         /* L0 or a state only reachable from it [rc]1287 */
++}
++
++static void
++log_pins(const char *label)
++{
++	LOG("%s pins: REG_ON gpg0-5 func %x dat %u pud %x drv %x | PERST# gpf2-2 func %x dat %u | "
++	    "CLKREQ# gpf2-0 func %x dat %u pud %x | host-wake gpa0-7 func %x dat %u pud %x", label,
++	    pin_field(&b_gpg0, BANK_CON, PIN_REG_ON), pin_dat(&b_gpg0, PIN_REG_ON),
++	    pin_field(&b_gpg0, BANK_PUD, PIN_REG_ON), pin_field(&b_gpg0, BANK_DRV, PIN_REG_ON),
++	    pin_field(&b_gpf2, BANK_CON, PIN_PERST), pin_dat(&b_gpf2, PIN_PERST),
++	    pin_field(&b_gpf2, BANK_CON, PIN_CLKREQ), pin_dat(&b_gpf2, PIN_CLKREQ),
++	    pin_field(&b_gpf2, BANK_PUD, PIN_CLKREQ),
++	    pin_field(&b_gpa0, BANK_CON, PIN_HOST_WAKE), pin_dat(&b_gpa0, PIN_HOST_WAKE),
++	    pin_field(&b_gpa0, BANK_PUD, PIN_HOST_WAKE));
++}
++
++/* ------------------------------------------------------------------------ */
++/* M1: the look (only reads)                                                 */
++
++static void
++m1_look(void)
++{
++	uint32_t pmu, lane0, s = 0xff;
++	bool isolated, elbi_ok, gpio_ok = true;
++	const char *why;
++
++	step("M1 clocks");
++	dump("M1", &b_top_mux, (const uint16_t[]){ 0 }, 1);
++	dump("M1", &b_top_div, (const uint16_t[]){ 0 }, 1);
++	dump("M1", &b_top_gate, (const uint16_t[]){ 0 }, 1);
++	dump("M1 mux/gates", &b_fsys1, fsys1_regs, N(fsys1_regs));
++	dump("M1 qch", &b_fsys1, fsys1_qch, N(fsys1_qch));
++	dump("M1", &b_peric0_gate, (const uint16_t[]){ 0 }, 1);
++	for (unsigned i = 0; i < N(pcie_gates); i++) {
++		if (gate_forced_off(rd(&b_fsys1, pcie_gates[i].off))) {
++			LOG("M1: PCIe gate %s (%#x) is forced off by hand", pcie_gates[i].name, pcie_gates[i].off);
++		}
++	}
++
++	step("M1 pmu/sysreg/sysmmu");
++	pmu = rd(&b_pmu, 0);
++	isolated = !(pmu & 1U);
++	LOG("M1 pmu PCIE_PHY_CONTROL(%llx)=%08x: PHY %s", b_pmu.pa, pmu, isolated ? "isolated" : "not isolated");
++	if (gate_forced_off(rd(&b_fsys1, GATE_SYSREG_FSYS1))) {
++		LOG("M1 sysreg not read: SYSREG_FSYS1 clock forced off");
++		lane0 = 0;
++	} else {
++		dump("M1", &b_sysreg, sysreg_regs, N(sysreg_regs));
++		dump("M1 (bits 9:8 = ch0 sharability)", &b_share, (const uint16_t[]){ 0 }, 1);
++		lane0 = rd(&b_sysreg, 0xc) & (1U << 12);
++	}
++	if (gate_forced_off(rd(&b_fsys1, GATE_SYSMMU_FSYS1))) {
++		LOG("M1 sysmmu not read: its clock is forced off");
++	} else {
++		dump("M1 (ctrl bit 0 = translating)", &b_mmu, mmu_regs, N(mmu_regs));
++	}
++
++	step("M1 pins");
++	if (gate_forced_off(rd(&b_fsys1, GATE_GPIO_FSYS1)) || gate_forced_off(rd(&b_peric0_gate, 0))) {
++		LOG("M1 pins not read: a GPIO clock is forced off (FSYS1 %08x, PERIC0 %08x)",
++		    rd(&b_fsys1, GATE_GPIO_FSYS1), rd(&b_peric0_gate, 0));
++		gpio_ok = false;
++	} else {
++		dump("M1", &b_gpg0, bank_regs, N(bank_regs));
++		dump("M1", &b_gpf2, bank_regs, N(bank_regs));
++		dump("M1", &b_gpa0, bank_regs, N(bank_regs));
++		log_pins("M1");
++	}
++
++	/* ELBI: Samsung writes it before it lifts the isolation ([rc]2328 -> 1494-1513, then 2329), so it is safe */
++	step("M1 elbi");
++	elbi_ok = !gate_forced_off(rd(&b_fsys1, GATE_ELBI));
++	if (!elbi_ok) {
++		LOG("M1 elbi not read: its clock is forced off");
++	} else {
++		dump("M1", &b_elbi, elbi_regs, N(elbi_regs));
++		s = ltssm();
++		LOG("M1 link: LTSSM %#x %s (0x11 = L0), LTSSM_EN %u, D-state %u", s, ltssm_name(s),
++		    rd(&b_elbi, ELBI_LTSSM_EN) & 1U, rd(&b_elbi, ELBI_PM_DSTATE) & 7U);
++	}
++
++	step("M1 phy/pcs/dbi");
++	why = isolated ? "the PMU isolates the PHY" : NULL;
++	if (why == NULL && gate_forced_off(rd(&b_fsys1, GATE_PHY_APB))) {
++		why = "PHY APB clock forced off";
++	}
++	if (why != NULL) {
++		LOG("M1 phy not read: %s", why);
++	} else {
++		dump("M1", &b_phy, phy_regs, N(phy_regs));
++	}
++	why = isolated ? "the PMU isolates the PHY" : NULL;
++	if (why == NULL && gate_forced_off(rd(&b_fsys1, GATE_PCS_APB))) {
++		why = "PCS APB clock forced off";
++	}
++	if (why != NULL) {
++		LOG("M1 pcs not read: %s", why);
++	} else {
++		dump("M1", &b_pcs, pcs_regs, N(pcs_regs));
++	}
++	/* Samsung reads the DBI of a link that is down only with RX electrical idle ignored ([rc]1634-1664), a write */
++	if (isolated || !lane0 || !elbi_ok || gate_forced_off(rd(&b_fsys1, GATE_DBI)) || !ltssm_up(s)) {
++		LOG("M1 dbi not read: %s", isolated ? "PHY isolated" : !lane0 ? "lane 0 off (sysreg+c bit 12)" :
++		    !elbi_ok ? "ELBI not read" : !ltssm_up(s) ? "link down (M2 reads it with RX elec idle ignored)" :
++		    "DBI clock forced off");
++	} else {
++		dump("M1", &b_dbi, dbi_regs, N(dbi_regs));
++	}
++
++	LOG("M1 done: PHY %s, lane0 %s, LTSSM %#x, REG_ON %s, PERST# %s", isolated ? "isolated" : "not isolated",
++	    lane0 ? "on" : "off", s, !gpio_ok ? "?" : pin_dat(&b_gpg0, PIN_REG_ON) ? "high" : "low",
++	    !gpio_ok ? "?" : pin_dat(&b_gpf2, PIN_PERST) ? "high (released)" : "low");
++}
++
++/* ------------------------------------------------------------------------ */
++/* M2: power, link, ids                                                      */
++
++/* exynos_phy_all_pwrdn_clear() [cal]97-127 and exynos_phy_all_pwrdn() [cal]62-94 (ch0) */
++static void
++phy_pwrdn_clear(void)
++{
++	set_clr(&b_pcs, PCS_REFCLK_OUT, 1U << 6, 0);
++	set_clr(&b_pcs, PCS_104, 1U << 7, 0);
++	wr(&b_phy, PHY_CMN_PWRDN, 0xc0);
++	wr(&b_phy, PHY_TRSV_PWRDN, 0x7e);
++}
++
++static void
++phy_pwrdn(void)
++{
++	wr(&b_phy, PHY_TRSV_PWRDN, 0xfe);
++	wr(&b_phy, PHY_CMN_PWRDN, 0xc1);
++	set_clr(&b_pcs, PCS_REFCLK_OUT, 0, 1U << 6);
++	set_clr(&b_pcs, PCS_104, 0, 1U << 7);
++}
++
++/* exynos_pcie_phy_config(), ch0 [cal]177-394 */
++static void
++phy_config(void)
++{
++	/* PCS_HIGH_SPEED; PHY mode [3:2] = 3 with [7:4] and bit 1 clear; lane 0 on [cal]252-261 */
++	set_clr(&b_sysreg, 0x0, 0, 1U << 1);
++	set_clr(&b_sysreg, 0xc, (0xfU << 4) | (0xfU << 2) | (1U << 1), 0x3U << 2);
++	set_clr(&b_sysreg, 0xc, 0, 1U << 12);
++	/* pcs_g_rst 1, 0, 1 [cal]270-276 */
++	wr(&b_elbi, ELBI_PCS_G_RST, 1);
++	spin_us(10);
++	wr(&b_elbi, ELBI_PCS_G_RST, 0);
++	spin_us(10);
++	wr(&b_elbi, ELBI_PCS_G_RST, 1);
++	spin_us(10);
++	/* the tables [cal]279-287 */
++	for (unsigned i = 0; i < N(phy_cmn); i++) {
++		wr(&b_phy, 4U * i, phy_cmn[i]);
++	}
++	for (unsigned i = 0; i < N(phy_trsv); i++) {
++		wr(&b_phy, 4U * (0x30U + i), phy_trsv[i]);
++	}
++	/* tx latency, refclk out, PRGM_TIMEOUT_L1SS [cal]346-357 */
++	wr(&b_pcs, PCS_TX_LATENCY, 0x70);
++	wr(&b_pcs, PCS_REFCLK_OUT, 0x87);
++	wr(&b_pcs, PCS_104, 0x50);
++	set_clr(&b_pcs, PCS_L1SS_CTRL, 1U << 1, 1U << 4);
++	/* MAC reset, then PCS & PMA common reset, each 1, 0, 1 [cal]366-380 */
++	wr(&b_elbi, ELBI_MAC_RST, 1);
++	spin_us(10);
++	wr(&b_elbi, ELBI_MAC_RST, 0);
++	spin_us(10);
++	wr(&b_elbi, ELBI_MAC_RST, 1);
++	spin_us(10);
++	wr(&b_elbi, ELBI_CMN_RST, 1);
++	spin_us(10);
++	wr(&b_elbi, ELBI_CMN_RST, 0);
++	spin_us(10);
++	wr(&b_elbi, ELBI_CMN_RST, 1);
++	spin_us(100);
++	/* CDR reset: [7:6] = 3, 20 us, = 2, = 0 [cal]382-392 */
++	set_clr(&b_pcs, PCS_CDR, 0, 0x3U << 6);
++	spin_us(20);
++	set_clr(&b_pcs, PCS_CDR, 0x3U << 6, 0x2U << 6);
++	set_clr(&b_pcs, PCS_CDR, 0x3U << 6, 0);
++}
++
++/* exynos_pcie_rd/wr_own_conf() with the link down: NCLK on and RX elec idle ignored around DBI use [rc]1634-1664 */
++static void
++dbi_open(void)
++{
++	wr(&b_elbi, ELBI_L12ERR_CTRL, 0);
++	set_clr(&b_pcs, PCS_ELECIDLE, 0, 1U << 3);
++}
++
++static void
++dbi_close(void)
++{
++	set_clr(&b_pcs, PCS_ELECIDLE, 1U << 3, 0);
++	wr(&b_elbi, ELBI_L12ERR_CTRL, 1U << 2);
++}
++
++/* dw_pcie_setup() [dwc]345, dw_pcie_setup_rc() [dwh]597 (no ATU: Samsung has rd_other_conf), exynos_pcie_setup_rc() [rc]1072 */
++static bool
++rc_setup(void)
++{
++	uint32_t id = rd(&b_dbi, DBI_ID);
++
++	if (id == 0 || id == ~0U) {
++		LOG("rc: the root port's id reads %08x: the DBI does not answer", id);
++		return false;
++	}
++	set_clr(&b_dbi, DBI_PORT_LINK, 0x3fU << 16, 0x1U << 16);         /* one lane */
++	set_clr(&b_dbi, DBI_WIDTH_SPEED, 0x1fU << 8, 0x1U << 8);
++	wr(&b_dbi, DBI_BAR0, 0x4);
++	wr(&b_dbi, DBI_BAR1, 0);
++	set_clr(&b_dbi, DBI_MISC, 0, 1);                                 /* DBI_RO_WR_EN */
++	set_clr(&b_dbi, DBI_INTPIN, 0xff00U, 0x0100U);                   /* INTA */
++	set_clr(&b_dbi, DBI_MISC, 1, 0);
++	set_clr(&b_dbi, DBI_BUSES, 0x00ffffffU, 0x00ff0100U);            /* primary 0, secondary 1, subordinate ff */
++	set_clr(&b_dbi, DBI_CMD, 0xffffU, 0x0107U);                      /* IO, MEM, MASTER, SERR */
++	wr(&b_dbi, DBI_BAR0, 0);
++	set_clr(&b_dbi, DBI_MISC, 0, 1);
++	set_clr(&b_dbi, DBI_CLASS, 0xffff0000U, 0x06040000U);            /* PCI-PCI bridge */
++	set_clr(&b_dbi, DBI_MISC, 1, 0);
++	set_clr(&b_dbi, DBI_WIDTH_SPEED, 0, 1U << 17);                   /* PORT_LOGIC_SPEED_CHANGE */
++	/* exynos_pcie_setup_rc(): RO writes stay enabled, as Samsung leaves them [rc]1081 */
++	set_clr(&b_dbi, DBI_MISC, 0, 1);
++	wr(&b_dbi, DBI_ID, 0xecec144dU);                                 /* 144d:ecec [rc]1084-1086 */
++	/* LNKCAP: L1 exit 64 us, x1, 5 GT/s capable (ch0) [rc]1089-1098 */
++	set_clr(&b_dbi, DBI_LNKCAP, (0x7U << 15) | (0x3fU << 4) | 0xfU, (0x7U << 15) | (0x1U << 4) | 0x2U);
++	wr(&b_dbi, DBI_AUX_CLK, 0x1a);                                   /* 26 MHz [rc]1101 */
++	wr(&b_dbi, DBI_L1SUB, 0xea);                                     /* [rc]1105 */
++	wr(&b_dbi, DBI_PMCSR, 0);                                        /* [rc]1108 */
++	set_clr(&b_dbi, DBI_LNKCTL, 0, 1U << 5);                         /* retrain [rc]1111-1113 */
++	set_clr(&b_dbi, DBI_LNKCTL2, 0xfU, 0x1U);                        /* target 2.5 GT/s: max-link-speed 1 [dt]9251 */
++	LOG("rc: root port id %08x -> %08x (want ecec144d), class %08x, lnkcap %08x, lnkctl2 %08x", id,
++	    rd(&b_dbi, DBI_ID), rd(&b_dbi, DBI_CLASS), rd(&b_dbi, DBI_LNKCAP), rd(&b_dbi, DBI_LNKCTL2));
++	return true;
++}
++
++/* LTSSM on, then L0 or LINK_POLL_US; the states it went through are logged ([y2s]469-501). */
++static bool
++train(unsigned attempt)
++{
++	char line[160];
++	uint8_t path[40];
++	unsigned npath = 0;
++	uint32_t s = 0xff, last = 0xff;
++	size_t at = 0;
++	bool up = false;
++	uint64_t start = mach_absolute_time(), end = start + us_to_abs(LINK_POLL_US);
++
++	wr(&b_elbi, ELBI_LTSSM_EN, 1);                  /* [rc]1281-1282 */
++	for (;;) {
++		s = ltssm();
++		if (s != last && npath < sizeof(path)) {
++			path[npath++] = (uint8_t)s;
++		}
++		last = s;
++		if (ltssm_up(s)) {
++			up = true;
++			break;
++		}
++		if (mach_absolute_time() > end || stop_now()) {
++			break;
++		}
++		spin_us(10);
++	}
++	line[0] = '\0';
++	for (unsigned j = 0; j < npath && at < sizeof(line); j++) {
++		at += (size_t)snprintf(line + at, sizeof(line) - at, " %02x", (unsigned)path[j]);
++	}
++	LOG("ltssm (try %u): %s after %llu us, now %#x %s; path:%s", attempt, up ? "UP" : "not up",
++	    abs_to_us(mach_absolute_time() - start), s, ltssm_name(s), line);
++	return up;
++}
++
++/* exynos_pcie_print_link_history() [rc]1054-1070: the last 32 LTSSM states */
++static void
++history(void)
++{
++	char line[160];
++	size_t at = 0;
++
++	line[0] = '\0';
++	for (int i = 31; i >= 0 && at < sizeof(line); i--) {
++		at += (size_t)snprintf(line + at, sizeof(line) - at, " %02x",
++		    (rd(&b_elbi, ELBI_HISTORY((uint32_t)i)) >> 16) & 0x3fU);
++	}
++	LOG("ltssm history:%s", line);
++}
++
++/* An outbound iATU region in viewport mode ([rc]1133-1152 CFG0 in region 1, [rc]1191-1215 MEM in region 0) */
++static void
++atu(uint32_t region, uint32_t type, uint32_t base, uint32_t size, uint32_t target)
++{
++	wr(&b_dbi, DBI_ATU_VIEWPORT, region);
++	wr(&b_dbi, DBI_ATU_CR1, type);
++	wr(&b_dbi, DBI_ATU_BASE, base);
++	wr(&b_dbi, DBI_ATU_UBASE, 0);
++	wr(&b_dbi, DBI_ATU_LIMIT, base + size - 1U);
++	wr(&b_dbi, DBI_ATU_TARGET, target);
++	wr(&b_dbi, DBI_ATU_UTARGET, 0);
++	wr(&b_dbi, DBI_ATU_CR2, ATU_ENABLE);
++}
++
++/* A BAR's size, by all ones and reading back (memory decode off) ([y2s]532-554) */
++static uint64_t
++bar_size(uint32_t off, bool *wide)
++{
++	uint32_t lo = rd(&b_cfg, off), hi, mlo, mhi = ~0U;
++	uint64_t mask;
++
++	*wide = (lo & 0x7U) == 0x4U;
++	wr(&b_cfg, off, ~0U);
++	mlo = rd(&b_cfg, off);
++	wr(&b_cfg, off, lo);
++	if (*wide) {
++		hi = rd(&b_cfg, off + 4);
++		wr(&b_cfg, off + 4, ~0U);
++		mhi = rd(&b_cfg, off + 4);
++		wr(&b_cfg, off + 4, hi);
++	}
++	if ((mlo & ~0xfU) == 0 && (!*wide || mhi == 0)) {
++		return 0;
++	}
++	mask = ((uint64_t)mhi << 32) | (mlo & ~0xfU);
++	return ~mask + 1ULL;
++}
++
++static int
++m2_pins(void)
++{
++	step("M2 pins");
++	if (gate_forced_off(rd(&b_fsys1, GATE_GPIO_FSYS1)) || gate_forced_off(rd(&b_peric0_gate, 0))) {
++		LOG("M2: a GPIO clock is forced off; not touching the pins");
++		return ENXIO;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		sv.gpf2[i] = rd(&b_gpf2, bank_regs[i]);
++		sv.gpg0[i] = rd(&b_gpg0, bank_regs[i]);
++	}
++	sv.pins = true;
++	/* PERST# an output, low: Samsung's probe requests it GPIOF_OUT_INIT_LOW [rc]2116-2125; drive 3 [dt]1155 */
++	pin_out(&b_gpf2, PIN_PERST, 0);
++	pin_set_field(&b_gpf2, BANK_DRV, PIN_PERST, 3);
++	/* CLKREQ#: function 2, pull-up, drive 3 (pinctrl "default" [d1x]2408, [dt]1132-1141) */
++	pin_set_field(&b_gpf2, BANK_CON, PIN_CLKREQ, 2);
++	pin_set_field(&b_gpf2, BANK_PUD, PIN_CLKREQ, 3);
++	pin_set_field(&b_gpf2, BANK_DRV, PIN_CLKREQ, 3);
++	/*
++	 * WLAN_REG_ON (cfg_wlanen: output, no pull, drive 3 [dt]1262-1271): low 20 ms so a chip S-Boot left on
++	 * starts from a real power-on ([y2s]587-594), then high and WIFI_TURNON_DELAY 200 ms before the link
++	 * ([dhd]86, 215-216; raw level 1 = on: gpio_direction_output() ignores the DT's active-low flag).
++	 */
++	sv.reg_on = true;
++	pin_set_field(&b_gpg0, BANK_PUD, PIN_REG_ON, 0);
++	pin_set_field(&b_gpg0, BANK_DRV, PIN_REG_ON, 3);
++	pin_out(&b_gpg0, PIN_REG_ON, 0);
++	IOSleep(20);
++	pin_out(&b_gpg0, PIN_REG_ON, 1);
++	IOSleep(200);
++	log_pins("M2 REG_ON on 200 ms:");
++	return stop_now() ? EIO : 0;
++}
++
++static int
++m2_clocks(void)
++{
++	uint32_t umux = 1;
++
++	step("M2 clocks");
++	PE_parse_boot_argn("d2swlan_umux", &umux, sizeof(umux));
++	sv.top_gate = rd(&b_top_gate, 0);
++	sv.umux_val = rd(&b_fsys1, UMUX_OFF);
++	for (unsigned i = 0; i < N(pcie_gates); i++) {
++		sv.gate[i] = rd(&b_fsys1, pcie_gates[i].off);
++	}
++	sv.clocks = true;
++	/* Forced on as mainline/z3s leave them: MANUAL set, auto gating clear, CG_VAL set ([y2s]599-613) */
++	set_clr(&b_top_gate, 0, GATE_HWACG, GATE_MANUAL | GATE_CG_VAL);
++	if (umux && !(sv.umux_val & UMUX_SEL)) {
++		sv.umux = true;
++		wr(&b_fsys1, UMUX_OFF, sv.umux_val | UMUX_SEL);
++		if (!wait_bits(&b_fsys1, UMUX_OFF, UMUX_BUSY, 0, 1000)) {
++			LOG("M2: PCIe user mux still busy after 1 ms (%08x)", rd(&b_fsys1, UMUX_OFF));
++		}
++	}
++	for (unsigned i = 0; i < N(pcie_gates); i++) {
++		set_clr(&b_fsys1, pcie_gates[i].off, GATE_HWACG, GATE_MANUAL | GATE_CG_VAL);
++	}
++	LOG("M2 clocks: top gate %08x -> %08x, user mux %08x -> %08x%s", sv.top_gate, rd(&b_top_gate, 0),
++	    sv.umux_val, rd(&b_fsys1, UMUX_OFF), umux ? "" : " (d2swlan_umux=0)");
++	dump("M2 gates", &b_fsys1, fsys1_regs, N(fsys1_regs));
++	return stop_now() ? EIO : 0;
++}
++
++static int
++m2_power(void)
++{
++	uint32_t e1, e2, p, c;
++
++	step("M2 pmu");
++	sv.pmu_phy = rd(&b_pmu, 0);
++	sv.pmu = true;
++	set_clr(&b_pmu, 0, 0, 1U);                      /* PHY isolation off [rc]2488-2490 */
++	spin_us(100);
++	LOG("M2 pmu PCIE_PHY_CONTROL %08x -> %08x (bit 0 set: not isolated)", sv.pmu_phy, rd(&b_pmu, 0));
++	/* the blocks must answer before anything is written to them */
++	e1 = rd(&b_elbi, ELBI_RDLH_LINKUP);
++	e2 = rd(&b_elbi, ELBI_QCH_SEL);
++	p = rd(&b_phy, PHY_CMN_PWRDN);
++	c = rd(&b_pcs, PCS_REFCLK_OUT);
++	LOG("M2 answer check: elbi 74=%08x 2c8=%08x, phy 80=%08x, pcs 100=%08x", e1, e2, p, c);
++	if ((e1 == ~0U && e2 == ~0U) || p == ~0U || c == ~0U) {
++		LOG("M2: ELBI, PHY or PCS reads all ones: not touching them");
++		return ENXIO;
++	}
++
++	step("M2 phy power-down clear, history");
++	sv.sysreg0 = rd(&b_sysreg, 0x0);
++	sv.sysreg_c = rd(&b_sysreg, 0xc);
++	sv.sysreg = true;
++	sv.phy = true;
++	phy_pwrdn_clear();                              /* [rc]2492-2498 */
++	wr(&b_elbi, ELBI_HISTORY_CHECK, 0);             /* history buffer [rc]2502-2509 */
++	wr(&b_elbi, ELBI_HISTORY_CHECK, 3);
++	wr(&b_elbi, ELBI_STATE_POWER_S, 0x200000);
++	wr(&b_elbi, ELBI_STATE_POWER_M, 0xffffffffU);
++	return stop_now() ? EIO : 0;
++}
++
++/* exynos_pcie_establish_link() [rc]1217-1344, without IA (only for L1.2 exit, [rc]1413-1486) and interrupts */
++static int
++m2_link(void)
++{
++	uint32_t v;
++	bool up = false, rc_ok = true;
++	unsigned t;
++
++	step("M2 link");
++	sv.link = true;
++	for (t = 1; t <= LINK_TRIES && !up && !stop_now(); t++) {
++		set_clr(&b_pcs, PCS_ELECIDLE, 0, 1U << 3);              /* [rc]1226-1230 */
++		wr(&b_elbi, ELBI_SOFT_CORE_RESET, 0);                   /* [rc]1232-1234 */
++		spin_us(20);
++		wr(&b_elbi, ELBI_SOFT_CORE_RESET, 1);
++		set_clr(&b_gpf2, BANK_DAT, 0, 1U << PIN_PERST);         /* PERST# released, 18-20 ms [rc]1236-1240 */
++		IOSleep(20);
++		set_clr(&b_elbi, ELBI_APP_REQ_EXIT_L1_MODE, 0, 0x1U | 0x10U);   /* [rc]1243-1246 */
++		wr(&b_elbi, ELBI_LINKDOWN_RST_SEL, 1U << 1);            /* [rc]1247-1248 */
++		set_clr(&b_elbi, ELBI_QCH_SEL, 0xfffU, 0);              /* no clock gating while training [rc]1250-1259 */
++		phy_config();                                           /* [rc]1404-1411 */
++		set_clr(&b_elbi, ELBI_SW_WAKE, 1U << 1, 0);             /* bus number enable [rc]1488-1491 */
++		dbi_open();
++		rc_ok = rc_setup();                                     /* [rc]1268-1269 */
++		dbi_close();                                            /* [rc]1271-1274 */
++		if (!rc_ok) {
++			break;
++		}
++		if (t == 1) {
++			LOG("M2 phy: sysreg %08x %08x; phy 0=%02x 4=%02x 80=%02x 15c=%02x (want 01 e1 c0 7e); "
++			    "pcs 100=%02x (want 87)", rd(&b_sysreg, 0), rd(&b_sysreg, 0xc), rd(&b_phy, 0) & 0xffU,
++			    rd(&b_phy, 4) & 0xffU, rd(&b_phy, PHY_CMN_PWRDN) & 0xffU, rd(&b_phy, PHY_TRSV_PWRDN) & 0xffU,
++			    rd(&b_pcs, PCS_REFCLK_OUT) & 0xffU);
++		}
++		LOG("M2 before LTSSM: D-state %u, LTSSM %#x", rd(&b_elbi, ELBI_PM_DSTATE) & 7U, ltssm());
++		up = train(t);
++		if (!up) {
++			/* PERST# low, LTSSM off [rc]1300-1309; 1 ms keeps PERST# low longer than T_PERST (100 us) */
++			set_clr(&b_gpf2, BANK_DAT, 1U << PIN_PERST, 0);
++			wr(&b_elbi, ELBI_LTSSM_EN, 0);
++			IOSleep(1);
++		}
++	}
++	if (!rc_ok) {
++		return ENXIO;
++	}
++	if (!up) {
++		LOG("M2 FAIL: no link after %u tries", t - 1);
++		history();
++		dump("M2 fail", &b_elbi, elbi_regs, N(elbi_regs));
++		dump("M2 fail", &b_pcs, pcs_regs, N(pcs_regs));
++		return stop_now() ? ECANCELED : ETIMEDOUT;
++	}
++
++	step("M2 link up");
++	wr(&b_elbi, ELBI_L12ERR_CTRL, 0);                               /* NCLK stays on while linked [rc]2516-2519 */
++	v = rd(&b_dbi, DBI_LNKCTL) >> 16;
++	LOG("link up: LTSSM %#x %s, Gen%u x%u (want Gen1 x1, max-link-speed 1)", ltssm(), ltssm_name(ltssm()),
++	    v & 0xfU, (v >> 4) & 0x3fU);
++	wr(&b_elbi, ELBI_IRQ_PULSE, rd(&b_elbi, ELBI_IRQ_PULSE));       /* stale pulses [rc]1331-1332 */
++	sv.atu = true;
++	atu(1, ATU_TYPE_CFG0, (uint32_t)CFG_PA, 0x1000, 1U << 24);      /* bus 1, dev 0, fn 0 [rc]1338-1339 */
++	atu(0, ATU_TYPE_MEM, (uint32_t)MEM_PA, (uint32_t)MEM_SIZE, (uint32_t)MEM_PA);  /* [rc]1340 */
++	wr(&b_dbi, DBI_ATU_VIEWPORT, 1);
++	v = rd(&b_dbi, DBI_ATU_CR2);
++	LOG("atu: region 1 CR2 %08x (want 80000000), CR1 %08x, base %08x, limit %08x, target %08x", v,
++	    rd(&b_dbi, DBI_ATU_CR1), rd(&b_dbi, DBI_ATU_BASE), rd(&b_dbi, DBI_ATU_LIMIT), rd(&b_dbi, DBI_ATU_TARGET));
++	dump("M2 link up", &b_dbi, dbi_regs, N(dbi_regs));
++	if (v != ATU_ENABLE) {
++		LOG("M2 FAIL: the iATU does not take the CFG0 region");
++		return ENXIO;
++	}
++	return stop_now() ? ECANCELED : 0;
++}
++
++static int
++m2_ids(void)
++{
++	uint32_t id = ~0U, cls, cmd, bar0, bar2, chipid, caps;
++	uint64_t s0, s2;
++	bool w0, w2;
++
++	step("M2 config");
++	if (!map_blk(&b_cfg)) {
++		return ENOMEM;
++	}
++	/* 100 ms after the link is up (PCIe base spec 6.6.1), then while it reads all ones or CRS, up to 1 s ([y2s]661-673) */
++	IOSleep(100);
++	for (unsigned i = 0; i < 100 && !stop_now(); i++) {
++		id = rd(&b_cfg, 0x00);
++		if (id != ~0U && (id & 0xffffU) != 0x0001U) {
++			break;
++		}
++		IOSleep(10);
++	}
++	cls = rd(&b_cfg, 0x08);
++	cmd = rd(&b_cfg, 0x04);
++	LOG("endpoint 01:00.0: id %04x:%04x (want 14e4:4475), class %06x rev %02x, header %02x, subsystem %08x, "
++	    "cmd/status %08x", id & 0xffffU, id >> 16, cls >> 8, cls & 0xffU, (rd(&b_cfg, 0x0c) >> 16) & 0x7fU,
++	    rd(&b_cfg, 0x2c), cmd);
++	if ((id & 0xffffU) != 0x14e4U) {
++		LOG("M2 FAIL: %s", id == ~0U ? "the endpoint does not answer configuration reads" : "not a Broadcom device");
++		return ENODEV;
++	}
++	if ((id >> 16) != 0x4475U) {
++		LOG("M2: device %04x is not the expected 4475 (BCM4375_D11AX_ID); going on", id >> 16);
++	}
++	if (cmd & 0x6U) {
++		wr(&b_cfg, 0x04, cmd & 0xfff9U);                        /* sizing needs memory decode off; status untouched */
++	}
++	s0 = bar_size(0x10, &w0);
++	s2 = bar_size(0x18, &w2);
++	LOG("endpoint BARs: BAR0 %s %llu KB, BAR2 %s %llu KB (y2sios: 32 KB and 4 MB, 64-bit)", w0 ? "64-bit" : "32-bit",
++	    s0 >> 10, w2 ? "64-bit" : "32-bit", s2 >> 10);
++	if (s0 < 0x1000 || s0 > 0x400000) {
++		LOG("M2 FAIL: BAR0 size %llu does not fit", s0);
++		return ENXIO;
++	}
++
++	step("M2 chip id");
++	/* the root port forwards the window (bridge memory base/limit, 1 MB granules; [y2s] redwood_bcm4375.c 1671) */
++	wr(&b_dbi, DBI_MEM_WIN, ((((uint32_t)(MEM_PA + MEM_SIZE - 1) >> 16) & 0xfff0U) << 16) |
++	    (((uint32_t)MEM_PA >> 16) & 0xfff0U));
++	bar0 = (uint32_t)MEM_PA;
++	wr(&b_cfg, 0x10, bar0);
++	if (w0) {
++		wr(&b_cfg, 0x14, 0);
++	}
++	/* BAR2 (TCM) is not used here; placed after BAR0 when it fits, so that no BAR decodes address 0 */
++	bar2 = 0;
++	if (s2 != 0 && s2 <= MEM_SIZE) {
++		uint64_t at = ((uint64_t)MEM_PA + s0 + s2 - 1) & ~(s2 - 1);
++		if (at + s2 <= (uint64_t)MEM_PA + MEM_SIZE) {
++			bar2 = (uint32_t)at;
++			wr(&b_cfg, 0x18, bar2);
++			if (w2) {
++				wr(&b_cfg, 0x1c, 0);
++			}
++		}
++	}
++	wr(&b_cfg, 0x04, (rd(&b_cfg, 0x04) & 0xfff8U) | 0x2U);         /* memory decode only: no bus master, no DMA */
++	wr(&b_cfg, EP_BAR0_WINDOW, SI_ENUM_BASE);                       /* the 4 KB window onto ChipCommon */
++	LOG("BARs: BAR0 %08x, BAR2 %08x, cmd %04x, bridge window %08x, BAR0 window %08x (want 18000000)",
++	    rd(&b_cfg, 0x10), rd(&b_cfg, 0x18), rd(&b_cfg, 0x04) & 0xffffU, rd(&b_dbi, DBI_MEM_WIN),
++	    rd(&b_cfg, EP_BAR0_WINDOW));
++	if (rd(&b_cfg, 0x10) != bar0 || rd(&b_cfg, EP_BAR0_WINDOW) != SI_ENUM_BASE) {
++		LOG("M2 FAIL: BAR0 or its window did not take the value");
++		return ENXIO;
++	}
++	if (!map_blk(&b_bar0)) {
++		return ENOMEM;
++	}
++	chipid = rd(&b_bar0, 0x0);
++	caps = rd(&b_bar0, 0x4);
++	LOG("chipcommon chip id %08x: BCM%04x rev %u package %u, type %u; capabilities %08x (want 4375 rev 5 = B1)",
++	    chipid, chipid & 0xffffU, (chipid >> 16) & 0xfU, (chipid >> 20) & 0xfU, chipid >> 28, caps);
++	if ((chipid & 0xffffU) != 0x4375U) {
++		LOG("M2 FAIL: not the BCM4375");
++		return ENODEV;
++	}
++	LOG("M2 PASS: link up, %04x:%04x, BCM4375 rev %u answers through BAR0", id & 0xffffU, id >> 16,
++	    (chipid >> 16) & 0xfU);
++	return 0;
++}
++
++/* exynos_pcie_send_pme_turn_off() [rc]2700-2767, one round */
++static void
++pme_turn_off(void)
++{
++	bool ack, l23;
++
++	wr(&b_elbi, ELBI_APP_REQ_EXIT_L1, 1);
++	set_clr(&b_elbi, ELBI_APP_REQ_EXIT_L1_MODE, 0x1U, 0x10U);
++	wr(&b_elbi, ELBI_XMIT_PME_TURNOFF, 1);
++	ack = wait_bits(&b_elbi, ELBI_IRQ_PULSE, IRQ_RADM_PM_TO_ACK, IRQ_RADM_PM_TO_ACK, 20000);
++	wr(&b_elbi, ELBI_XMIT_PME_TURNOFF, 0);
++	l23 = wait_bits(&b_elbi, ELBI_RDLH_LINKUP, 0x1fU, 0x15U, 20000);
++	LOG("off: PME_Turn_Off %s, %s (LTSSM %#x)", ack ? "acked" : "not acked", l23 ? "L2/L3 ready" : "no L2/L3 ready",
++	    ltssm());
++}
++
++/*
++ * exynos_pcie_poweroff() [rc]2586-2697, then dhd_wlan_power(0) [dhd]131: only what M2 changed, in reverse.
++ * Sysreg, PMU and clocks go back to what S-Boot left (Samsung leaves them on); PERST# stays an output, low, as
++ * Samsung's "idle" pin state ([d1x]2409); REG_ON an output, low.
++ */
++static void
++power_off(int error)
++{
++	step("off");
++	LOG("off after %s (error %d)", error ? "a failure" : "M2", error);
++	wl_abort = false;               /* the power-off itself must run (each access is still checked) */
++	wl_bug = false;
++	if (sv.link) {
++		/* no DBI access from here on: with the link leaving L0 Samsung only reaches it with RX elec idle ignored */
++		if (sv.atu && ltssm_up(ltssm())) {
++			pme_turn_off();
++		}
++		set_clr(&b_elbi, ELBI_HISTORY_CHECK, 3U, 0);   /* [rc]2621-2624 */
++		set_clr(&b_gpf2, BANK_DAT, 1U << PIN_PERST, 0); /* [rc]2626 */
++		wr(&b_elbi, ELBI_LTSSM_EN, 0);                  /* [rc]2631-2632 */
++	}
++	if (sv.phy) {
++		phy_pwrdn();                                    /* [rc]2635-2641 */
++		wr(&b_elbi, ELBI_L12ERR_CTRL, 1U << 2);         /* [rc]2679-2683 */
++	}
++	if (sv.sysreg) {
++		wr(&b_sysreg, 0xc, sv.sysreg_c);
++		wr(&b_sysreg, 0x0, sv.sysreg0);
++	}
++	if (sv.pmu) {
++		wr(&b_pmu, 0, sv.pmu_phy);
++	}
++	if (sv.clocks) {
++		for (unsigned i = N(pcie_gates); i-- > 0;) {
++			wr(&b_fsys1, pcie_gates[i].off, sv.gate[i]);
++		}
++		if (sv.umux) {
++			wr(&b_fsys1, UMUX_OFF, sv.umux_val);
++			(void)wait_bits(&b_fsys1, UMUX_OFF, UMUX_BUSY, 0, 1000);
++		}
++		wr(&b_top_gate, 0, sv.top_gate);
++	}
++	if (sv.reg_on) {
++		pin_out(&b_gpg0, PIN_REG_ON, 0);
++	}
++	if (sv.pins) {
++		pin_out(&b_gpf2, PIN_PERST, 0);
++		pin_set_field(&b_gpf2, BANK_CON, PIN_CLKREQ, (sv.gpf2[0] >> (PIN_CLKREQ * 4U)) & 0xfU);
++		pin_set_field(&b_gpf2, BANK_PUD, PIN_CLKREQ, (sv.gpf2[2] >> (PIN_CLKREQ * 4U)) & 0xfU);
++		pin_set_field(&b_gpf2, BANK_DRV, PIN_CLKREQ, (sv.gpf2[3] >> (PIN_CLKREQ * 4U)) & 0xfU);
++		log_pins("off:");
++	}
++	LOG("off: done%s: pmu %08x, top gate %08x, user mux %08x%s", wl_bug ? " (with refused accesses)" : "",
++	    rd(&b_pmu, 0), rd(&b_top_gate, 0), rd(&b_fsys1, UMUX_OFF), sv.clocks ? "; gates as found" : "");
++}
++
++static int
++m2(void)
++{
++	int e;
++
++	if ((e = m2_pins()) != 0 || (e = m2_clocks()) != 0 || (e = m2_power()) != 0 || (e = m2_link()) != 0) {
++		return e;
++	}
++	return m2_ids();
++}
++
++/* ------------------------------------------------------------------------ */
++/* The Wi-Fi DMA pool (milestone 4 uses it; checked here)                    */
++
++#define POOL_PA_DEFAULT         0x99000000U
++#define POOL_SIZE_DEFAULT       0x02000000U     /* 32 MiB */
++#define POOL_GRANULE            0x10000U
++#define POOL_MAX                0x04000000U
++#define POOL_PER_GRANULE        3U
++
++static uint32_t pool_saved[POOL_MAX / POOL_GRANULE * POOL_PER_GRANULE];
++static uint32_t pool_pa, pool_size;
++static vm_offset_t pool_va;
++static bool pool_ok;
++
++/* The first low DRAM bank (d1x /proc/device-tree: 0x80000000 + 0x3AB00000) and what in it is not ours */
++#define LOW_BANK_BASE           0x80000000ULL
++#define LOW_BANK_END            0xbab00000ULL
++static const struct {
++	uint32_t        base, size;
++	const char      *what;
++} pool_avoid[] = {
++	{ 0x80000000U, 0x00001000U, "sec_debug_magic" },                /* [dt]2892 */
++	{ 0x87000000U, 0x00200000U, "el2 (hypervisor)" },
++	{ 0x91200000U, 0x00001000U, "mm_debug" },                        /* [dt]2887 */
++	{ 0x96000000U, 0x03000000U, "secure camera ION heaps (TZ-protectable)" },       /* [d1x]2594, 2602 */
++};
++#define DISPLAY_AREA_BASE       0x9b000000ULL   /* the display work's buffers, upward */
++#define DISPLAY_AREA_END        0xb4800000ULL   /* end of Android's camera carve-out [d1x]2609 */
++
++static const char *
++pool_bad(uint64_t base, uint64_t size)
++{
++	if ((base & (POOL_GRANULE - 1)) || (size & (POOL_GRANULE - 1)) || size < 0x100000U || size > POOL_MAX) {
++		return "base and size must be 64 KiB multiples, size 1 to 64 MiB";
++	}
++	if (base < LOW_BANK_BASE || base + size > LOW_BANK_END) {
++		return "outside the first low DRAM bank 0x80000000-0xbab00000";
++	}
++	for (unsigned i = 0; i < N(pool_avoid); i++) {
++		if (base < (uint64_t)pool_avoid[i].base + pool_avoid[i].size && pool_avoid[i].base < base + size) {
++			return pool_avoid[i].what;
++		}
++	}
++	return NULL;
++}
++
++static uint32_t
++pool_off(uint32_t i)                    /* each granule's first, middle and last word */
++{
++	static const uint32_t in[POOL_PER_GRANULE] = { 0, POOL_GRANULE / 2, POOL_GRANULE - 4 };
++
++	return (i / POOL_PER_GRANULE) * POOL_GRANULE + in[i % POOL_PER_GRANULE];
++}
++
++static uint32_t
++pool_pattern(uint32_t pa, uint32_t salt)        /* depends on the address: aliasing shows */
++{
++	uint32_t x = pa ^ salt;
++
++	x ^= x >> 16;
++	x *= 0x7feb352dU;
++	x ^= x >> 15;
++	x *= 0x846ca68bU;
++	x ^= x >> 16;
++	return x;
++}
++
++static volatile uint32_t *
++pool_word(uint32_t i)
++{
++	return (volatile uint32_t *)(pool_va + pool_off(i));
++}
++
++static void
++pool_check(void)
++{
++	uint32_t n, zero = 0, ones = 0, digest = 0, bad = 0, changed = 0, first_bad = ~0U, v;
++	const char *why;
++
++	step("pool");
++	pool_pa = POOL_PA_DEFAULT;
++	pool_size = POOL_SIZE_DEFAULT;
++	PE_parse_boot_argn("d2swlan_pool", &pool_pa, sizeof(pool_pa));
++	PE_parse_boot_argn("d2swlan_pool_size", &pool_size, sizeof(pool_size));
++	if (pool_size == 0) {
++		LOG("pool: none (d2swlan_pool_size=0)");
++		return;
++	}
++	why = pool_bad(pool_pa, pool_size);
++	if (why != NULL) {
++		LOG("pool %#x + %#x refused: %s", pool_pa, pool_size, why);
++		return;
++	}
++	if ((uint64_t)pool_pa < DISPLAY_AREA_END && DISPLAY_AREA_BASE < (uint64_t)pool_pa + pool_size) {
++		LOG("pool: note, %#x + %#x overlaps the display buffers' area from 0x9b000000", pool_pa, pool_size);
++	}
++	/* uncached (normal non-cacheable), from kernel_map: the 8 MB io_submap of ml_io_map() cannot take 32 MB ([y2s]697-705) */
++	pool_va = ml_io_map_unmappable(pool_pa, pool_size, VM_WIMG_WCOMB);
++	if (pool_va == 0) {
++		LOG("pool: not mapped");
++		return;
++	}
++	n = pool_size / POOL_GRANULE * POOL_PER_GRANULE;
++	/* 1. what is there, kept to be put back */
++	for (uint32_t i = 0; i < n; i++) {
++		v = *pool_word(i);
++		pool_saved[i] = v;
++		zero += v == 0;
++		ones += v == ~0U;
++		digest = digest * 31U + v;
++	}
++	LOG("pool %#x-%#x at %#lx uncached: %u sample words, %u zero, %u all ones, digest %08x", pool_pa,
++	    pool_pa + pool_size - 1, (unsigned long)pool_va, n, zero, ones, digest);
++	/* 2. two address-dependent patterns written and read back */
++	for (uint32_t pass = 0; pass < 2; pass++) {
++		uint32_t salt = pass ? 0x5a5aa5a5U : 0xa5a55a5aU;
++		for (uint32_t i = 0; i < n; i++) {
++			*pool_word(i) = pool_pattern(pool_pa + pool_off(i), salt);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (uint32_t i = 0; i < n; i++) {
++			if (*pool_word(i) != pool_pattern(pool_pa + pool_off(i), salt)) {
++				bad++;
++				first_bad = first_bad == ~0U ? pool_pa + pool_off(i) : first_bad;
++			}
++		}
++	}
++	/* 3. does anything else write here? */
++	IOSleep(2000);
++	wl_beat = mach_absolute_time();
++	for (uint32_t i = 0; i < n; i++) {
++		if (*pool_word(i) != pool_pattern(pool_pa + pool_off(i), 0x5a5aa5a5U)) {
++			changed++;
++			first_bad = first_bad == ~0U ? pool_pa + pool_off(i) : first_bad;
++		}
++	}
++	/* 4. put back what was there */
++	for (uint32_t i = 0; i < n; i++) {
++		*pool_word(i) = pool_saved[i];
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	pool_ok = bad == 0 && changed == 0;
++	if (pool_ok) {
++		LOG("pool PASS: %#x + %#x, %u words x 2 patterns read back right, none changed in 2 s; contents put back",
++		    pool_pa, pool_size, n);
++	} else {
++		LOG("pool FAIL: %u read back wrong, %u changed by someone else in 2 s, first at %#x; contents put back",
++		    bad, changed, first_bad);
++	}
++}
++
++/* For milestone 4: the pool, once this boot's check passed. */
++int
++d2s_wlan_pool(uint64_t *pa, vm_offset_t *va, uint32_t *size)
++{
++	if (!pool_ok) {
++		return ENOENT;
++	}
++	*pa = pool_pa;
++	*va = pool_va;
++	*size = pool_size;
++	return 0;
++}
++
++/* ------------------------------------------------------------------------ */
++
++static void
++wlan_thread(__unused void *arg, __unused wait_result_t wres)
++{
++	uint32_t wait_s = 15, pooltest = wl_level >= 2 ? 1 : 0, ms;
++	int e;
++
++	PE_parse_boot_argn("d2swlan_wait", &wait_s, sizeof(wait_s));
++	PE_parse_boot_argn("d2swlan_pooltest", &pooltest, sizeof(pooltest));
++	if (wait_s > 600) {
++		wait_s = 600;
++	}
++	/* Nothing until the root is mounted: UFS (same FSYS1 bus) is up and the root mount never waits on this. */
++	for (ms = 0; rootvnode == NULLVP && ms < 600000; ms += 100) {
++		IOSleep(100);
++	}
++	if (rootvnode == NULLVP) {
++		LOG("no root after 600 s: nothing done");
++		goto out;
++	}
++	LOG("root mounted (%u ms after start): M1", ms);
++	for (unsigned i = 0; i < N(m1_blocks); i++) {
++		if (!map_blk(m1_blocks[i])) {
++			goto out;
++		}
++	}
++	wl_active = true;
++	m1_look();
++	wl_active = false;
++	if (wl_level >= 2 && !wl_bug_seen) {
++		LOG("M2 in %u s (d2swlan_wait)", wait_s);
++		IOSleep(wait_s * 1000U);
++		wl_m2_start = mach_absolute_time();
++		wl_m2 = true;
++		wl_active = true;
++		e = m2();
++		wl_m2 = false;          /* the power-off runs whatever the budget */
++		power_off(e);
++		wl_active = false;
++	}
++	if (pooltest && !wl_bug_seen) {
++		wl_active = true;
++		pool_check();
++		wl_active = false;
++	}
++out:
++	wl_active = false;
++	wl_done = true;
++	LOG("done");
++}
++
++void
++d2s_wlan_start(void)
++{
++	static bool started;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	if (!PE_parse_boot_argn("d2swlan", &wl_level, sizeof(wl_level)) || wl_level == 0) {
++		return;
++	}
++	if (wl_level > 2) {
++		LOG("d2swlan=%u: this build has levels 1 and 2; running 2", wl_level);
++		wl_level = 2;
++	}
++	LOG("d2swlan=%u: %s; waiting for the root file system", wl_level,
++	    wl_level == 1 ? "M1, read only" : "M1, then M2: power, link, chip id, power off");
++	wl_beat = mach_absolute_time();
++	if (kernel_thread_start(wlan_thread, NULL, &thread) != KERN_SUCCESS) {
++		LOG("no thread: nothing done");
++		return;
++	}
++	thread_deallocate(thread);
++	if (kernel_thread_start(wlan_watchdog, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		LOG("no watchdog thread (the steps are bounded anyway)");
++	}
++}
++
++#else
++void
++d2s_wlan_start(void)
++{
++}
++
++int
++d2s_wlan_pool(__unused uint64_t *pa, __unused vm_offset_t *va, __unused uint32_t *size)
++{
++	return ENOTSUP;
++}
++#endif /* D2S */
