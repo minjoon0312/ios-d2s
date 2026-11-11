@@ -1,0 +1,320 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 17c5289..995c2e0 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/d1x_camera.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index c5aed2e..201cc2d 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1417,6 +1417,7 @@ dreamlte_touch_start(void)
+ }
+ #endif /* DREAMLTE */
+ 
++extern void d1x_camera_start(void);
+ extern void d2s_wlan_start(void);
+ extern void d2s_gpu_start(void);
+ extern void d2s_files_start(void);
+@@ -1431,6 +1432,7 @@ a5xelte_touch_probe(void)
+ 	dreamlte_touch_start();   /* the A5 path below stays off */
+ #endif
+ #if defined(D2S)
++	d1x_camera_start();       /* camera stage 0, read-only look, boot-arg d2scam, off by default (d1x_camera.c) */
+ 	d2s_wlan_start();         /* Wi-Fi PCIe probe, boot-arg d2swlan: own thread, after the root mount (d2s_wlan.c) */
+ 	d2s_cpufreq_start();      /* CPU clocks over ACPM, boot-arg d2scpufreq (d2s_cpufreq.c) */
+ 	d2s_gpu_start();          /* Mali-G76 core + boot self-test (d2s_gpu.c) */
+diff --git a/bsd/dev/d1x_camera.c b/bsd/dev/d1x_camera.c
+new file mode 100644
+index 0000000..493dfa5
+--- /dev/null
++++ b/bsd/dev/d1x_camera.c
+@@ -0,0 +1,282 @@
++/*
++ * Galaxy Note 10 5G (d1x, SM-N971N, Exynos 9825): camera, stage 0 probe.
++ * research/CAMERA_PLAN.md stage 0. READ ONLY: it logs what the bootloader
++ * left for the camera path and changes nothing. Nothing here runs unless the
++ * boot-arg d2scam >= 1.
++ *
++ * What it reads (written from facts, no code copied):
++ *  - PMU power domains (always-on block 0x15860000). Each domain is
++ *    CONFIGURATION at its DT reg, STATUS at +0x4 (bit 0 = on), OPTION at +0x8:
++ *    Samsung's flexpmu_cal_local_exynos9820.h isppre_on[] writes
++ *    ISPPRE_CONFIGURATION 0x15862500 and waits on ISPPRE_STATUS 0x15862504
++ *    bit 0; d2s_gpu.c already reads G3D's STATUS the same way. Domains from
++ *    cruel/exynos9825.dts: pd-dpu@15861e00 (ISPPRE's parent), pd-isppre@15862500
++ *    (CSIS0-4, their WDMAs, the D-PHYs), pd-isphq@15862400, pd-isplp@15862480,
++ *    pd-vra2@15862b00.
++ *  - CMU_TOP ("CMU_CMU", 0x1a240000, always on; cal-if/exynos9820/cmucal-sfr.c
++ *    :7): CLKCMU_ISPPRE_BUS (mux 0x1094 [1:0] = SHARED4, SHARED0/4, SHARED1/4,
++ *    SHARED2/2; div 0x1884 [3:0]; gate 0x20a0 MANUAL bit 20, CG_VAL bit 21) and
++ *    CLKCMU_CIS_CLK0..3, the sensors' MCLKs (mux 0x1010.. [0] = OSCCLK or
++ *    SHARED2/2; div 0x180c.. [4:0]; gates 0x2028, 0x202c, 0x2030, 0x2034).
++ *  - The camera pins (pinctrl banks 0x20 apart, CON +0x0 4 bits a pin, DAT
++ *    +0x4, PUD +0x8, DRV +0xc, CONPDN +0x10, PUDPDN +0x14; bank order from the
++ *    DT's pinctrl nodes, gpg1 at PERIC0+0xa0 and gph1 at PERIC1+0x100 as
++ *    d1x_haptics.c uses them):
++ *      PERIC1 0x10830000: gpc1 +0x80 (pins 4..7 = CIS_CLK0..3: function 2 is
++ *      the clock, 1 a plain output; sensor-mclk*-fn/out), gpg3 +0xc0 (gpg3-0
++ *      = tele 3M5 reset)
++ *      PERIC0 0x10430000: gpp3 +0x60 (flash/torch gpio), gpg0 +0x80
++ *      (ultra-wide 3P9 reset, the DT phandle is unclear), gpg2 +0xc0 (rear 2L4
++ *      and front 3J1 resets), gpg4 +0xe0 (gpio_subcam_sel, front/tele mux)
++ *  - With d2scam=2 and ONLY when the PMU says ISPPRE (and its parent DPU) is
++ *    already on: the two CMU_ISPPRE registers Linux itself reads while the
++ *    domain is on (isppre_save[]: PLL_CON0_MUX_CLKCMU_ISPPRE_BUS_USER +0x100,
++ *    CLK_CON_DIV_DIV_CLK_ISPPRE_BUSP +0x1804 of 0x17000000), then, only if the
++ *    user mux selects CMU_TOP's clock (bit 4), CSIS0's VERSION (+0x0) and
++ *    CMN_CTRL (+0x4) at 0x17030000 (offsets as in fimc-is-hw-csi-v5_1.h; v5_2
++ *    assumed the same). The Galaxy S9 port (Exynos 9810) took a synchronous
++ *    external abort reading a CMU_ISPPRE Q-channel debug register, so no
++ *    DBG_NFO/Q-channel register is read here, and nothing in ISPPRE is read
++ *    when the domain is off.
++ *
++ * Never touched: regulators (S2MPB02/S2MPB03 are on I2C buses this file does
++ * not drive), GPIO direction or level, clocks, power domains, SMCs, the
++ * SysMMU (0x17210000), the HSI2C blocks (their clocks may be gated: a read
++ * could abort), DRAM carve-outs.
++ *
++ * Boot-args:
++ *   d2scam=0   default: nothing at all (no MMIO mapped)
++ *   d2scam=1   PMU domains, CMU_TOP camera clocks, camera pins: always-on
++ *              blocks only
++ *   d2scam=2   1 + CMU_ISPPRE and CSIS0 IDs, only if ISPPRE is found on
++ * Log lines start with "D1X CAM:".
++ */
++#include <stdbool.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++
++void d1x_camera_start(void);
++
++#if defined(D2S)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++#define LOG(fmt, ...)   printf("D1X CAM: " fmt "\n", ##__VA_ARGS__)
++
++/* ---- PMU (always on) ---- */
++#define PMU_PD_PA       0x15861000u     /* covers 0x15861e00 .. 0x15862bff */
++#define PMU_PD_SIZE     0x2000u
++#define PD_CONFIG       0x0u
++#define PD_STATUS       0x4u
++#define PD_OPTION       0x8u
++
++static const struct {
++	const char      *name;
++	uint32_t        pa;             /* the domain's DT reg = CONFIGURATION */
++} pds[] = {
++	{ "dpu (parent)", 0x15861e00u },
++	{ "isppre", 0x15862500u },
++	{ "isphq", 0x15862400u },
++	{ "isplp", 0x15862480u },
++	{ "vra2", 0x15862b00u },
++};
++#define PD_DPU          0
++#define PD_ISPPRE       1
++
++/* ---- CMU_TOP (always on) ---- */
++#define CMU_TOP_PA      0x1a241000u     /* 0x1a240000 + 0x1000: offsets 0x1010 .. 0x20a0 */
++#define CMU_TOP_SIZE    0x2000u
++#define CMU_TOP_OFF     0x1000u
++#define ISPPRE_BUS_MUX  0x1094u
++#define ISPPRE_BUS_DIV  0x1884u
++#define ISPPRE_BUS_GAT  0x20a0u
++#define CIS_MUX(n)      (0x1010u + 4u * (n))
++#define CIS_DIV(n)      (0x180cu + 4u * (n))
++static const uint32_t cis_gat[4] = { 0x2028u, 0x202cu, 0x2030u, 0x2034u };
++#define GAT_MANUAL      (1u << 20)
++#define GAT_CG_VAL      (1u << 21)
++#define CMU_BUSY        (1u << 16)
++#define CMU_AUTO        (1u << 28)
++
++/* ---- pins ---- */
++#define PERIC0_GPIO_PA  0x10430000u
++#define PERIC1_GPIO_PA  0x10830000u
++#define GPIO_SIZE       0x200u
++
++static const struct {
++	const char      *name;
++	int             peric;          /* 0 or 1 */
++	uint32_t        off;
++	uint8_t         pins;           /* camera pins of interest, a bit each */
++	const char      *what;
++} banks[] = {
++	{ "gpc1", 1, 0x080u, 0xf0u, "pins 4..7 = CIS_CLK0..3 (fn 2 clock, 1 output)" },
++	{ "gpg3", 1, 0x0c0u, 0x01u, "pin 0 = 3M5 tele reset" },
++	{ "gpp3", 0, 0x060u, 0x00u, "flash/torch gpio" },
++	{ "gpg0", 0, 0x080u, 0x48u, "3P9 ultra-wide reset (DT unclear: pin 3 or 6)" },
++	{ "gpg2", 0, 0x0c0u, 0x00u, "2L4 rear and 3J1 front resets" },
++	{ "gpg4", 0, 0x0e0u, 0x00u, "gpio_subcam_sel (front/tele CSIS2 mux)" },
++};
++
++/* ---- ISPPRE (only with d2scam=2 and the domain found on) ---- */
++#define CMU_ISPPRE_PA   0x17000000u
++#define CMU_ISPPRE_SIZE 0x2000u
++#define ISPPRE_BUS_USER 0x0100u         /* bit 4 MUX_SEL: 1 = CMU_TOP's CLKCMU_ISPPRE_BUS */
++#define ISPPRE_BUSP_DIV 0x1804u
++#define CSIS0_PA        0x17030000u
++#define CSIS_VERSION    0x000u
++#define CSIS_CMN_CTRL   0x004u
++
++static int cam_level;
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static bool
++show_domains(vm_offset_t pmu, bool *isppre_on)
++{
++	bool dpu_on = false;
++
++	for (unsigned i = 0; i < sizeof(pds) / sizeof(pds[0]); i++) {
++		vm_offset_t r = pmu + (pds[i].pa - PMU_PD_PA);
++		uint32_t cfg = rd(r, PD_CONFIG), st = rd(r, PD_STATUS), opt = rd(r, PD_OPTION);
++
++		LOG("pd %-12s %#x: CONFIGURATION %#x STATUS %#x OPTION %#x -> %s",
++		    pds[i].name, pds[i].pa, cfg, st, opt, (st & 1) ? "ON" : "off");
++		if (i == PD_DPU) {
++			dpu_on = (st & 1) != 0;
++		} else if (i == PD_ISPPRE) {
++			*isppre_on = (st & 1) != 0;
++		}
++	}
++	return dpu_on;
++}
++
++static void
++show_clocks(vm_offset_t top)
++{
++	static const char *const isppre_src[4] = { "SHARED4", "SHARED0/4", "SHARED1/4", "SHARED2/2" };
++	uint32_t m = rd(top, ISPPRE_BUS_MUX - CMU_TOP_OFF);
++	uint32_t d = rd(top, ISPPRE_BUS_DIV - CMU_TOP_OFF);
++	uint32_t g = rd(top, ISPPRE_BUS_GAT - CMU_TOP_OFF);
++
++	LOG("CLKCMU_ISPPRE_BUS: mux %#x (%s%s%s) div %#x (/%u%s) gate %#x (%s)",
++	    m, isppre_src[m & 3], (m & CMU_BUSY) ? ", busy" : "", (m & CMU_AUTO) ? ", auto" : "",
++	    d, (d & 0xf) + 1, (d & CMU_BUSY) ? ", busy" : "",
++	    g, (g & GAT_MANUAL) ? ((g & GAT_CG_VAL) ? "manual on" : "manual OFF") : "auto");
++	for (unsigned n = 0; n < 4; n++) {
++		m = rd(top, CIS_MUX(n) - CMU_TOP_OFF);
++		d = rd(top, CIS_DIV(n) - CMU_TOP_OFF);
++		g = rd(top, cis_gat[n] - CMU_TOP_OFF);
++		LOG("CLKCMU_CIS_CLK%u: mux %#x (%s) div %#x (/%u) gate %#x (%s)",
++		    n, m, (m & 1) ? "SHARED2/2" : "OSCCLK", d, (d & 0x1f) + 1,
++		    g, (g & GAT_MANUAL) ? ((g & GAT_CG_VAL) ? "manual on" : "manual OFF") : "auto");
++	}
++}
++
++static void
++show_pins(vm_offset_t peric0, vm_offset_t peric1)
++{
++	for (unsigned i = 0; i < sizeof(banks) / sizeof(banks[0]); i++) {
++		vm_offset_t b = (banks[i].peric ? peric1 : peric0) + banks[i].off;
++		uint32_t con = rd(b, 0x0), dat = rd(b, 0x4), pud = rd(b, 0x8);
++		uint32_t drv = rd(b, 0xc), conpdn = rd(b, 0x10), pudpdn = rd(b, 0x14);
++		char fn[9];
++
++		for (unsigned p = 0; p < 8; p++) {
++			fn[p] = "0123456789abcdef"[(con >> (4 * p)) & 0xf];
++		}
++		fn[8] = '\0';
++		LOG("%s (%s): CON %#010x (fn pin0..7 %s) DAT %#04x PUD %#x DRV %#x CONPDN %#x PUDPDN %#x",
++		    banks[i].name, banks[i].what, con, fn, dat & 0xff, pud, drv, conpdn, pudpdn);
++		for (unsigned p = 0; p < 8; p++) {
++			if (banks[i].pins & (1u << p)) {
++				LOG("  %s-%u: fn %u, level %u", banks[i].name, p, (con >> (4 * p)) & 0xf, (dat >> p) & 1);
++			}
++		}
++	}
++}
++
++static void
++show_isppre(void)
++{
++	vm_offset_t cmu = ml_io_map(CMU_ISPPRE_PA, CMU_ISPPRE_SIZE);
++	vm_offset_t csis;
++	uint32_t user, busp;
++
++	if (!cmu) {
++		LOG("CMU_ISPPRE: map failed");
++		return;
++	}
++	user = rd(cmu, ISPPRE_BUS_USER);
++	busp = rd(cmu, ISPPRE_BUSP_DIV);
++	LOG("CMU_ISPPRE: BUS_USER %#x (%s) BUSP_DIV %#x (/%u)", user,
++	    (user & (1u << 4)) ? "CMU_TOP's clock" : "OSCCLK", busp, (busp & 0xf) + 1);
++	if (!(user & (1u << 4))) {
++		LOG("CSIS0 not read: ISPPRE runs on OSCCLK (the boot did not set it up)");
++		return;
++	}
++	csis = ml_io_map(CSIS0_PA, 0x1000);
++	if (!csis) {
++		LOG("CSIS0: map failed");
++		return;
++	}
++	LOG("CSIS0 %#x: VERSION %#x CMN_CTRL %#x", CSIS0_PA, rd(csis, CSIS_VERSION), rd(csis, CSIS_CMN_CTRL));
++}
++
++void
++d1x_camera_start(void)
++{
++	vm_offset_t pmu, top, peric0, peric1;
++	bool isppre_on = false, dpu_on;
++
++	if (!PE_parse_boot_argn("d2scam", &cam_level, sizeof(cam_level)) || cam_level <= 0) {
++		return;
++	}
++	if (cam_level > 2) {
++		cam_level = 2;
++	}
++	LOG("probe level %d: read only, nothing is powered, clocked or driven", cam_level);
++
++	pmu = ml_io_map(PMU_PD_PA, PMU_PD_SIZE);
++	top = ml_io_map(CMU_TOP_PA, CMU_TOP_SIZE);
++	peric0 = ml_io_map(PERIC0_GPIO_PA, GPIO_SIZE);
++	peric1 = ml_io_map(PERIC1_GPIO_PA, GPIO_SIZE);
++	if (!pmu || !top || !peric0 || !peric1) {
++		LOG("map failed (pmu %p top %p peric0 %p peric1 %p): stopping",
++		    (void *)pmu, (void *)top, (void *)peric0, (void *)peric1);
++		return;
++	}
++
++	dpu_on = show_domains(pmu, &isppre_on);
++	show_clocks(top);
++	show_pins(peric0, peric1);
++
++	if (cam_level < 2) {
++		LOG("done (level 1)");
++		return;
++	}
++	if (!isppre_on || !dpu_on) {
++		LOG("ISPPRE %s, DPU %s: nothing in ISPPRE is read (d2scam=2 only reads a domain the boot left on)",
++		    isppre_on ? "on" : "off", dpu_on ? "on" : "off");
++		LOG("done (level 2)");
++		return;
++	}
++	show_isppre();
++	LOG("done (level 2)");
++}
++
++#else /* !D2S */
++
++void
++d1x_camera_start(void)
++{
++}
++
++#endif /* D2S */
