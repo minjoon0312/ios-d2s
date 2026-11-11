@@ -1,0 +1,528 @@
+diff --git a/iokit/Kernel/arm/SweetBacklight.cpp b/iokit/Kernel/arm/SweetBacklight.cpp
+new file mode 100644
+index 0000000..86db185
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetBacklight.cpp
+@@ -0,0 +1,494 @@
++/*
++ * 0160: AppleARMBacklight for the Note 10 5G (d1x): the service iOS's brightness system looks for, so the
++ * Settings / Control Center slider has somewhere to go.
++ *
++ * Ported from guacamole 0197 (research/ext/ios-guacamole/xnu/patches/0197-guacamole-applearmbacklight.patch):
++ * CoreBrightness (in backboardd) finds the built-in display's brightness control with
++ * IOServiceGetMatchingServices({IOPropertyMatch: {backlight-control: true}}), checks IOObjectConformsTo(service,
++ * "AppleARMBacklight") and builds its display modules on it (guacamole NOTES.md, "0197 AppleARMBacklight so
++ * CoreBrightness starts"). With none it logs "Built in display/backlight driver has not been found.", which is the
++ * state of our kernel before this patch.
++ *
++ * The service carries the iPhone X's /device-tree/backlight node (DBVMin 139 / DBVMax 2047, marketing table,
++ * restriction curves; taken unchanged from 0197), backlight-control = true, IODisplayParameters
++ * { brightness = { min 0, max 65536, value } } and a user client that accepts every selector.
++ *
++ * Boot-arg d2sbl (default 0):
++ *   0  not registered (start() fails): no change from 0158.
++ *   1  registered; each brightness level iOS asks for is logged "D1X BL: ..." and kept as a property
++ *      (IODisplayParameters, d1x-bl-level, d1x-bl-percent) so userland or a later patch can read it back.
++ *      The panel is NOT touched.
++ *   2  reserved for panel writes, NOT implemented: behaves as 1 and says so once. Why: on this panel
++ *      (s6e3fa7_davinci1_a3_s0, research/cruel/exynos9820-d1x_kor_23.dts:7096) Samsung's set-brightness
++ *      sequence is not a DCS 0x51 write. research/cruel/fa7_davinci1.h:1190-1205 (set_bl_cmdtbl) sends, under
++ *      the 0xF0 0x5A 0x5A key (:534), a 34-byte gamma packet 0xCA (:625), AOR 0xB1 (:640), ELVSS 0xB5 (:641),
++ *      ACL, IRC 0xB8, then 0xF7 0x03 (:674). The per-level gamma table is empty in the source (:87) and filled
++ *      at run time from the panel's own MTP calibration (init_gamma_table, :488), so there is no fixed byte
++ *      sequence to send per level. DSIM0 is at 0x19080000 (research/cruel/exynos9825.dts:6776-6778), but its
++ *      command FIFO registers are not in our research tree. Writing guessed values could leave the panel dark
++ *      or overdriven, so d2sbl=2 waits for the DSIM driver + dimming data (see the patch notes).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSBoolean.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSSymbol.h>
++#include <pexpert/pexpert.h>
++#include <sys/proc.h>
++
++/* /device-tree/backlight of the iPhone X (research/ipsw-x/d22ap.adt), but its name, phandle and function-* entries */
++static const uint8_t d1x_bl_0[] = {	/* DBVMax */
++	0xff, 0x07, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_1[] = {	/* DBVMin */
++	0x8b, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_2[] = {	/* LmaxProduct */
++	0x41, 0x07, 0xa2, 0x02,
++};
++static const uint8_t d1x_bl_3[] = {	/* LmidProduct */
++	0x00, 0x00, 0x9b, 0x00,
++};
++static const uint8_t d1x_bl_4[] = {	/* LminProduct */
++	0x00, 0x00, 0x02, 0x00,
++};
++static const uint8_t d1x_bl_5[] = {	/* aab-cap-e */
++	0x00, 0x00, 0x1e, 0x00, 0xe8, 0x03, 0x88, 0x13,
++};
++static const uint8_t d1x_bl_6[] = {	/* aab-cap-l */
++	0x32, 0x00, 0x2c, 0x01, 0x26, 0x02, 0xff, 0xff,
++};
++static const uint8_t d1x_bl_7[] = {	/* aab-constraint-emax */
++	0x88, 0x13, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_8[] = {	/* aab-constraint-lmax */
++	0xa3, 0x02, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_9[] = {	/* backlight-id */
++	0xff, 0xff, 0xff, 0xff,
++};
++static const uint8_t d1x_bl_10[] = {	/* backlight-marketing-table */
++	0x00, 0x00, 0x02, 0x00, 0xac, 0xbc, 0x02, 0x00, 0x02, 0x8b, 0x03, 0x00, 0xc6, 0x6b, 0x04, 0x00, 0x83, 0x60,
++	0x05, 0x00, 0x3d, 0x6a, 0x06, 0x00, 0x3d, 0x8a, 0x07, 0x00, 0xca, 0xc1, 0x08, 0x00, 0xeb, 0x11, 0x0a, 0x00,
++	0xe7, 0x7b, 0x0b, 0x00, 0xc4, 0x00, 0x0d, 0x00, 0x0c, 0xa2, 0x0e, 0x00, 0xc4, 0x60, 0x10, 0x00, 0x35, 0x3e,
++	0x12, 0x00, 0x22, 0x3b, 0x14, 0x00, 0x51, 0x58, 0x16, 0x00, 0x87, 0x96, 0x18, 0x00, 0x45, 0xf6, 0x1a, 0x00,
++	0x93, 0x78, 0x1d, 0x00, 0xb2, 0x1d, 0x20, 0x00, 0x66, 0xe6, 0x22, 0x00, 0xb0, 0xd2, 0x25, 0x00, 0x0c, 0xe2,
++	0x28, 0x00, 0x7a, 0x14, 0x2c, 0x00, 0xba, 0x69, 0x2f, 0x00, 0xca, 0xe1, 0x32, 0x00, 0x28, 0x7c, 0x36, 0x00,
++	0x0a, 0x37, 0x3a, 0x00, 0x20, 0x10, 0x3e, 0x00, 0x1e, 0x05, 0x42, 0x00, 0xf7, 0x13, 0x46, 0x00, 0x5e, 0x3a,
++	0x4a, 0x00, 0x45, 0x76, 0x4e, 0x00, 0xa1, 0xc5, 0x52, 0x00, 0x6c, 0x27, 0x57, 0x00, 0xdb, 0x99, 0x5b, 0x00,
++	0x22, 0x1b, 0x60, 0x00, 0x3d, 0xaa, 0x64, 0x00, 0x60, 0x45, 0x69, 0x00, 0xe3, 0xe5, 0x6d, 0x00, 0x89, 0x81,
++	0x72, 0x00, 0x0e, 0x0d, 0x77, 0x00, 0x70, 0x7d, 0x7b, 0x00, 0xef, 0xc7, 0x7f, 0x00, 0x89, 0xe1, 0x83, 0x00,
++	0x37, 0xc9, 0x87, 0x00, 0xa3, 0x90, 0x8b, 0x00, 0x49, 0x4c, 0x8f, 0x00, 0xdf, 0x0f, 0x93, 0x00, 0xdf, 0xef,
++	0x96, 0x00, 0x00, 0x00, 0x9b, 0x00, 0x20, 0x50, 0x9f, 0x00, 0xb2, 0xdd, 0xa3, 0x00, 0x8f, 0xa2, 0xa8, 0x00,
++	0xce, 0x97, 0xad, 0x00, 0xc8, 0xb6, 0xb2, 0x00, 0xd4, 0xf8, 0xb7, 0x00, 0x10, 0x58, 0xbd, 0x00, 0xbc, 0xd4,
++	0xc2, 0x00, 0xeb, 0x71, 0xc8, 0x00, 0xf1, 0x32, 0xce, 0x00, 0x64, 0x1b, 0xd4, 0x00, 0x56, 0x2e, 0xda, 0x00,
++	0x1a, 0x6f, 0xe0, 0x00, 0x00, 0xe0, 0xe6, 0x00, 0x0c, 0x82, 0xed, 0x00, 0x04, 0x56, 0xf4, 0x00, 0x70, 0x5d,
++	0xfb, 0x00, 0x93, 0x98, 0x02, 0x01, 0x37, 0x09, 0x0a, 0x01, 0x62, 0xb0, 0x11, 0x01, 0x20, 0x90, 0x19, 0x01,
++	0x3d, 0xaa, 0x21, 0x01, 0x89, 0x01, 0x2a, 0x01, 0x8d, 0x97, 0x32, 0x01, 0x56, 0x6e, 0x3b, 0x01, 0x72, 0x88,
++	0x44, 0x01, 0xef, 0xe7, 0x4d, 0x01, 0x5c, 0x8f, 0x57, 0x01, 0x06, 0x81, 0x61, 0x01, 0x7c, 0xbf, 0x6b, 0x01,
++	0x4f, 0x4d, 0x76, 0x01, 0x8b, 0x2c, 0x81, 0x01, 0x00, 0x60, 0x8c, 0x01, 0x43, 0xeb, 0x97, 0x01, 0xa3, 0xd0,
++	0xa3, 0x01, 0xb6, 0x13, 0xb0, 0x01, 0x4b, 0xb7, 0xbc, 0x01, 0x35, 0xbe, 0xc9, 0x01, 0x49, 0x2c, 0xd7, 0x01,
++	0xa1, 0x05, 0xe5, 0x01, 0xdd, 0x77, 0xf5, 0x01, 0xc1, 0x6e, 0x06, 0x02, 0x51, 0xef, 0x17, 0x02, 0xac, 0xfd,
++	0x29, 0x02, 0x8a, 0x9e, 0x3c, 0x02, 0x39, 0xd7, 0x4f, 0x02, 0x8f, 0xab, 0x63, 0x02, 0xda, 0x20, 0x78, 0x02,
++	0x3b, 0x3b, 0x8d, 0x02, 0x41, 0x07, 0xa2, 0x02,
++};
++static const uint8_t d1x_bl_11[] = {	/* backlight-update-policy */
++	0x04, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_12[] = {	/* blr-cct-warning */
++	0x8c, 0x0a, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_13[] = {	/* compatible */
++	0x62, 0x61, 0x63, 0x6b, 0x6c, 0x69, 0x67, 0x68, 0x74, 0x00,
++};
++static const uint8_t d1x_bl_14[] = {	/* device_type */
++	0x62, 0x61, 0x63, 0x6b, 0x6c, 0x69, 0x67, 0x68, 0x74, 0x00,
++};
++static const uint8_t d1x_bl_15[] = {	/* display-backlight-calibration */
++	0x00, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_16[] = {	/* gs-b-min */
++	0x84, 0x03, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_17[] = {	/* gs-i-nominal */
++	0xe0, 0x01, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_18[] = {	/* gs-i-threshold */
++	0xe8, 0x03, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_19[] = {	/* gs-slope */
++	0xf4, 0x01, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_20[] = {	/* max-nit-value */
++	0xee, 0x02, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_21[] = {	/* max-restriction-factors */
++	0x72, 0x01, 0x2f, 0x03, 0x2f, 0x03, 0x2f, 0x03, 0x2f, 0x03, 0xe8, 0x03,
++};
++static const uint8_t d1x_bl_22[] = {	/* max-restriction-fall-time */
++	0x10, 0x27, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_23[] = {	/* max-restriction-rise-time */
++	0x88, 0x13, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_24[] = {	/* max-restriction-thresholds */
++	0x01, 0x00, 0x1e, 0x00, 0x64, 0x00, 0xf4, 0x01, 0xe8, 0x03, 0x88, 0x13,
++};
++static const uint8_t d1x_bl_25[] = {	/* min-restriction-factors */
++	0xe8, 0x03, 0xe8, 0x03, 0xb8, 0x0b, 0xb8, 0x0b, 0x70, 0x17, 0x70, 0x17,
++};
++static const uint8_t d1x_bl_26[] = {	/* min-restriction-fall-time */
++	0x10, 0x27, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_27[] = {	/* min-restriction-rise-time */
++	0x88, 0x13, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_28[] = {	/* min-restriction-thresholds */
++	0x01, 0x00, 0x1e, 0x00, 0x64, 0x00, 0xf4, 0x01, 0xe8, 0x03, 0x88, 0x13,
++};
++static const uint8_t d1x_bl_29[] = {	/* multi-point-restriction */
++	0x01, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_30[] = {	/* override-boot-brightness */
++	0xe4, 0x02, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_31[] = {	/* panel-gamma */
++	0x98, 0x08, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_32[] = {	/* pre-strobe-nit */
++	0xa2, 0x02, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_33[] = {	/* restriction-pivoting-l */
++	0x64, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_34[] = {	/* restriction-pivoting-l-2 */
++	0x1e, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_35[] = {	/* truetone-strength */
++	0x00, 0x00, 0x0e, 0x01, 0x0e, 0x01, 0xc8, 0x00, 0xc8, 0x00, 0xc8, 0x00,
++};
++static const uint8_t d1x_bl_36[] = {	/* use-AAB-architecture */
++	0x01, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_37[] = {	/* use-AAP */
++	0x01, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_38[] = {	/* use-Nits2DACTable */
++	0x01, 0x00, 0x00, 0x00,
++};
++static const uint8_t d1x_bl_39[] = {	/* use-new-AAP-ramp */
++	0x01, 0x00, 0x00, 0x00,
++};
++static const struct { const char *key; const uint8_t *bytes; unsigned length; } d1x_bl_adt[] = {
++	{ "DBVMax", d1x_bl_0, sizeof(d1x_bl_0) },
++	{ "DBVMin", d1x_bl_1, sizeof(d1x_bl_1) },
++	{ "LmaxProduct", d1x_bl_2, sizeof(d1x_bl_2) },
++	{ "LmidProduct", d1x_bl_3, sizeof(d1x_bl_3) },
++	{ "LminProduct", d1x_bl_4, sizeof(d1x_bl_4) },
++	{ "aab-cap-e", d1x_bl_5, sizeof(d1x_bl_5) },
++	{ "aab-cap-l", d1x_bl_6, sizeof(d1x_bl_6) },
++	{ "aab-constraint-emax", d1x_bl_7, sizeof(d1x_bl_7) },
++	{ "aab-constraint-lmax", d1x_bl_8, sizeof(d1x_bl_8) },
++	{ "backlight-id", d1x_bl_9, sizeof(d1x_bl_9) },
++	{ "backlight-marketing-table", d1x_bl_10, sizeof(d1x_bl_10) },
++	{ "backlight-update-policy", d1x_bl_11, sizeof(d1x_bl_11) },
++	{ "blr-cct-warning", d1x_bl_12, sizeof(d1x_bl_12) },
++	{ "compatible", d1x_bl_13, sizeof(d1x_bl_13) },
++	{ "device_type", d1x_bl_14, sizeof(d1x_bl_14) },
++	{ "display-backlight-calibration", d1x_bl_15, sizeof(d1x_bl_15) },
++	{ "gs-b-min", d1x_bl_16, sizeof(d1x_bl_16) },
++	{ "gs-i-nominal", d1x_bl_17, sizeof(d1x_bl_17) },
++	{ "gs-i-threshold", d1x_bl_18, sizeof(d1x_bl_18) },
++	{ "gs-slope", d1x_bl_19, sizeof(d1x_bl_19) },
++	{ "max-nit-value", d1x_bl_20, sizeof(d1x_bl_20) },
++	{ "max-restriction-factors", d1x_bl_21, sizeof(d1x_bl_21) },
++	{ "max-restriction-fall-time", d1x_bl_22, sizeof(d1x_bl_22) },
++	{ "max-restriction-rise-time", d1x_bl_23, sizeof(d1x_bl_23) },
++	{ "max-restriction-thresholds", d1x_bl_24, sizeof(d1x_bl_24) },
++	{ "min-restriction-factors", d1x_bl_25, sizeof(d1x_bl_25) },
++	{ "min-restriction-fall-time", d1x_bl_26, sizeof(d1x_bl_26) },
++	{ "min-restriction-rise-time", d1x_bl_27, sizeof(d1x_bl_27) },
++	{ "min-restriction-thresholds", d1x_bl_28, sizeof(d1x_bl_28) },
++	{ "multi-point-restriction", d1x_bl_29, sizeof(d1x_bl_29) },
++	{ "override-boot-brightness", d1x_bl_30, sizeof(d1x_bl_30) },
++	{ "panel-gamma", d1x_bl_31, sizeof(d1x_bl_31) },
++	{ "pre-strobe-nit", d1x_bl_32, sizeof(d1x_bl_32) },
++	{ "restriction-pivoting-l", d1x_bl_33, sizeof(d1x_bl_33) },
++	{ "restriction-pivoting-l-2", d1x_bl_34, sizeof(d1x_bl_34) },
++	{ "truetone-strength", d1x_bl_35, sizeof(d1x_bl_35) },
++	{ "use-AAB-architecture", d1x_bl_36, sizeof(d1x_bl_36) },
++	{ "use-AAP", d1x_bl_37, sizeof(d1x_bl_37) },
++	{ "use-Nits2DACTable", d1x_bl_38, sizeof(d1x_bl_38) },
++	{ "use-new-AAP-ramp", d1x_bl_39, sizeof(d1x_bl_39) },
++};
++
++#define D1X_BL_MAX      65536u          /* IODisplayParameters brightness range (0 - max), as 0197 */
++#define D1X_BL_OTHER    80u             /* other setProperties keys logged */
++#define D1X_BL_UC_LINES 400u            /* user client lines logged */
++
++static uint32_t d1x_bl_mode;            /* d2sbl */
++static IOLock *d1x_bl_lock;
++static uint64_t d1x_bl_level = D1X_BL_MAX / 2;
++static unsigned d1x_bl_other_said;
++static unsigned d1x_bl_uc_said;
++static uint64_t d1x_bl_sel_seen;        /* selectors < 64 seen once */
++static uint64_t d1x_bl_sel_last[64];    /* last scalar input 0 logged per selector */
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++
++private:
++	void publishLevel(uint64_t value);
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++/* IODisplayParameters = { brightness = { min, max, value } } */
++static OSDictionary *
++d1x_bl_parameters(uint64_t value)
++{
++	OSDictionary *params = OSDictionary::withCapacity(1);
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSNumber *min = OSNumber::withNumber(0ULL, 32);
++	OSNumber *max = OSNumber::withNumber((unsigned long long)D1X_BL_MAX, 32);
++	OSNumber *now = OSNumber::withNumber(value, 32);
++	if (params != NULL && brightness != NULL && min != NULL && max != NULL && now != NULL) {
++		brightness->setObject("min", min);
++		brightness->setObject("max", max);
++		brightness->setObject("value", now);
++		params->setObject("brightness", brightness);
++	}
++	OSSafeReleaseNULL(min);
++	OSSafeReleaseNULL(max);
++	OSSafeReleaseNULL(now);
++	OSSafeReleaseNULL(brightness);
++	return params;
++}
++
++/* iOS level (0 - 65536) as percent x10 (0 - 1000), for the log and d1x-bl-percent */
++static unsigned
++d1x_bl_permille(uint64_t value)
++{
++	if (value > D1X_BL_MAX) {
++		value = D1X_BL_MAX;
++	}
++	return (unsigned)((value * 1000u + D1X_BL_MAX / 2) / D1X_BL_MAX);
++}
++
++/* key names that may carry a level: logged on every change instead of only the first D1X_BL_OTHER */
++static bool
++d1x_bl_levelish(const char *key)
++{
++	static const char *const words[] = { "rightness", "nits", "Nits", "DBV", "level", "Level" };
++	for (unsigned w = 0; w < sizeof(words) / sizeof(words[0]); w++) {
++		size_t n = strlen(words[w]);
++		for (const char *p = key; *p != '\0'; p++) {
++			if (strncmp(p, words[w], n) == 0) {
++				return true;
++			}
++		}
++	}
++	return false;
++}
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	d1x_bl_mode = 0;
++	PE_parse_boot_argn("d2sbl", &d1x_bl_mode, sizeof(d1x_bl_mode));
++	if (d1x_bl_mode == 0) {
++		IOLog("D1X BL: AppleARMBacklight off (d2sbl=0)\n");
++		return false;
++	}
++	if (d1x_bl_mode >= 2) {
++		IOLog("D1X BL: d2sbl=%u: panel writes are not implemented (S6E3FA7 davinci needs MTP-based "
++		    "gamma/AOR/ELVSS, not DCS 0x51); logging only, as d2sbl=1\n", d1x_bl_mode);
++		d1x_bl_mode = 1;
++	}
++	if (d1x_bl_lock == NULL) {
++		d1x_bl_lock = IOLockAlloc();
++		if (d1x_bl_lock == NULL) {
++			return false;
++		}
++	}
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setName("backlight");
++	for (unsigned i = 0; i < sizeof(d1x_bl_adt) / sizeof(d1x_bl_adt[0]); i++) {
++		OSData *data = OSData::withBytes(d1x_bl_adt[i].bytes, d1x_bl_adt[i].length);
++		if (data != NULL) {
++			setProperty(d1x_bl_adt[i].key, data);
++			data->release();
++		}
++	}
++	setProperty("backlight-control", kOSBooleanTrue);
++	setProperty("d1x-bl-mode", (unsigned long long)d1x_bl_mode, 32);
++	publishLevel(d1x_bl_level);
++	setProperty(kIOUserClientClassKey, "AppleARMBacklightUserClient");
++	registerService();
++	IOLog("D1X BL: AppleARMBacklight registered (d2sbl=%u, iPhone X backlight properties, backlight-control, "
++	    "no panel writes)\n", d1x_bl_mode);
++	return true;
++}
++
++/* keep the level where iOS (and ioreg) can read it back */
++void
++AppleARMBacklight::publishLevel(uint64_t value)
++{
++	OSDictionary *params = d1x_bl_parameters(value);
++	if (params != NULL) {
++		setProperty("IODisplayParameters", params);
++		params->release();
++	}
++	setProperty("d1x-bl-level", (unsigned long long)value, 32);
++	setProperty("d1x-bl-percent", (unsigned long long)d1x_bl_permille(value) / 10u, 32);
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	if (it == NULL) {
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(d1x_bl_lock);
++	const OSSymbol *key;
++	while ((key = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		OSObject *value = dict->getObject(key);
++		OSNumber *number = OSDynamicCast(OSNumber, value);
++		if (key->isEqualTo("IODisplayParameters")) {
++			/* { brightness = N } or { brightness = { value = N } }: the value, the range kept */
++			OSDictionary *sub = OSDynamicCast(OSDictionary, value);
++			OSObject *b = sub != NULL ? sub->getObject("brightness") : NULL;
++			OSNumber *n = OSDynamicCast(OSNumber, b);
++			if (n == NULL && OSDynamicCast(OSDictionary, b) != NULL) {
++				n = OSDynamicCast(OSNumber, OSDynamicCast(OSDictionary, b)->getObject("value"));
++			}
++			if (n == NULL) {
++				if (d1x_bl_other_said < D1X_BL_OTHER) {
++					d1x_bl_other_said++;
++					IOLog("D1X BL: %s sets IODisplayParameters without a brightness number\n", name);
++				}
++				continue;
++			}
++			uint64_t level = n->unsigned64BitValue();
++			if (level != d1x_bl_level) {
++				unsigned pm = d1x_bl_permille(level);
++				IOLog("D1X BL: %s level %llu / %u (%u.%u%%)%s\n", name, level, D1X_BL_MAX, pm / 10u, pm % 10u,
++				    level > D1X_BL_MAX ? " (above max, clamped in percent)" : "");
++				d1x_bl_level = level;
++				publishLevel(level);
++			}
++			continue;
++		}
++		const char *k = key->getCStringNoCopy();
++		bool levelish = number != NULL && d1x_bl_levelish(k);
++		bool changed = true;
++		if (levelish) {
++			OSNumber *old = OSDynamicCast(OSNumber, getProperty(key));
++			changed = old == NULL || old->unsigned64BitValue() != number->unsigned64BitValue();
++		}
++		if ((levelish && changed) || d1x_bl_other_said < D1X_BL_OTHER) {
++			if (!levelish) {
++				d1x_bl_other_said++;
++			}
++			IOLog("D1X BL: %s sets %s (%s) %llu\n", name, k,
++			    value != NULL ? value->getMetaClass()->getClassName() : "null",
++			    number != NULL ? number->unsigned64BitValue() : 0ULL);
++		}
++		if (value != NULL && !key->isEqualTo("backlight-control") && strncmp(k, "d1x-bl-", 7) != 0) {
++			setProperty(key, value);        /* kept: readable back (ioreg) */
++		}
++	}
++	IOLockUnlock(d1x_bl_lock);
++	it->release();
++	return kIOReturnSuccess;
++}
++
++class AppleARMBacklightUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleARMBacklightUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklightUserClient, IOUserClient);
++
++IOReturn
++AppleARMBacklightUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++/*
++ * Every selector is accepted with zeroed outputs (as 0197). Which selector, if any, carries a level is not known
++ * (0197 never recorded it), so each call is logged the first time per selector and again whenever its first
++ * scalar input changes, up to D1X_BL_UC_LINES lines.
++ */
++IOReturn
++AppleARMBacklightUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
++    __unused void *reference)
++{
++	for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
++		args->scalarOutput[i] = 0;
++	}
++	if (args->structureOutputDescriptor != NULL) {
++		IOByteCount len = args->structureOutputDescriptor->getLength();
++		for (IOByteCount off = 0; off < len; off += 8) {
++			static const uint64_t zero = 0;
++			args->structureOutputDescriptor->writeBytes(off, &zero, len - off < 8 ? len - off : 8);
++		}
++	} else if (args->structureOutput != NULL) {
++		bzero(args->structureOutput, args->structureOutputSize);
++	}
++	uint64_t s0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++	uint64_t s1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0;
++	bool say = false;
++	IOLockLock(d1x_bl_lock);
++	if (selector >= 64) {
++		say = d1x_bl_uc_said < D1X_BL_UC_LINES;
++	} else if (!(d1x_bl_sel_seen & (1ULL << selector)) || d1x_bl_sel_last[selector] != s0) {
++		say = d1x_bl_uc_said < D1X_BL_UC_LINES;
++		d1x_bl_sel_seen |= 1ULL << selector;
++		d1x_bl_sel_last[selector] = s0;
++	}
++	if (say) {
++		d1x_bl_uc_said++;
++	}
++	IOLockUnlock(d1x_bl_lock);
++	if (say) {
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("D1X BL: %s sel %u in %u [%llu %llu] /%u out %u/%u -> ok\n", name, selector,
++		    args->scalarInputCount, s0, s1, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize);
++	}
++	return kIOReturnSuccess;
++}
++#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 1fefb39..2fbbf95 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -102,6 +102,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = D2SGPU;"
+     "   },"
++    "   {"
++    "     'IOClass'         = AppleARMBacklight;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleARMBacklight;"
++    "   },"
+ #endif
+ #endif
+     "   {"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index b58fa68..9bd5c4e 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,6 +16,7 @@ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetBacklight.cpp                              optional iokitcpp
+ iokit/Kernel/arm/D2SGPU.cpp                                      optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

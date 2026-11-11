@@ -1,0 +1,375 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index e0bcecd..17c5289 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/d2s_gpu.c			standard
+ bsd/dev/d2s_cpufreq.c			standard
+ bsd/dev/d1x_haptics.c			standard
++bsd/dev/d1x_mali.c			standard
+ bsd/kern/d2s_files.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 42ce927..c5aed2e 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1422,6 +1422,7 @@ extern void d2s_gpu_start(void);
+ extern void d2s_files_start(void);
+ extern void d2s_cpufreq_start(void);
+ extern void d1x_haptics_start(void);
++extern void d1x_mali_start(void);
+ 
+ void
+ a5xelte_touch_probe(void)
+@@ -1435,6 +1436,7 @@ a5xelte_touch_probe(void)
+ 	d2s_gpu_start();          /* Mali-G76 core + boot self-test (d2s_gpu.c) */
+ 	d2s_files_start();        /* boot-image files into the iOS root (d2s_files.c) */
+ 	d1x_haptics_start();      /* CS40L25A motor, boot-arg d2shaptic, off by default (d1x_haptics.c) */
++	d1x_mali_start();         /* Mali-G76 read-only probe, boot-arg d1xmali, off by default (d1x_mali.c) */
+ #endif
+ 	int enabled = A5_TOUCH_DEFAULT; /* A5 touch: off on the S8 */
+ 	int log_contacts = 0;
+diff --git a/bsd/dev/d1x_mali.c b/bsd/dev/d1x_mali.c
+new file mode 100644
+index 0000000..cc1e303
+--- /dev/null
++++ b/bsd/dev/d1x_mali.c
+@@ -0,0 +1,314 @@
++/*
++ * Galaxy Note 10 5G (d1x, SM-N971N, Exynos 9825): Mali-G76 MP12, read-only
++ * probe. Stage 1 of the GPU bring-up in research/GPU_METAL_9825.md (M1:
++ * "GPU alive on d1x", plus the PLL_G3D readout asked there). Nothing here
++ * runs unless boot-arg d1xmali >= 1, and nothing here writes a register.
++ *
++ * Facts, with sources (research/ paths; Samsung's kernel is GPL-2.0 and was
++ * read for facts only, no code taken):
++ *  - Mali registers: base 0x18500000, 0x5000 bytes; SPIs 288 JOB, 287 MMU,
++ *    289 GPU (cruel/exynos9825.dts:5211-5215, mali@18500000).
++ *  - Its power domain is pd-embedded_g3d (cruel/exynos9825.dts:5217-5218),
++ *    node pd-embedded_g3d@15862100, reg 0x15862100 size 0x20, cal_id
++ *    0xb1380007, need_smc 0x18410204 (cruel/exynos9825.dts:3993-3997).
++ *  - PMU (pmu_alive, always on) at 0x15860000 (cruel/exynos9825.dts:5976-5980).
++ *    The Mali node itself names the status register: gpu_pmu_status_reg_offset
++ *    0x2104, gpu_pmu_status_local_pwr_mask 0x1 (cruel/exynos9825.dts:5226-5227),
++ *    i.e. 0x15862104 bit 0.
++ *  - Samsung's PMU CAL for the 9820/9825 (ext/CruelKernel_exynos9820_usb/
++ *    drivers/soc/samsung/cal-if/exynos9820/flexpmu_cal_local_exynos9820.h):
++ *    embedded_g3d_status (:596-598) reads EMBEDDED_G3D_STATUS +0x2104 bit 0;
++ *    embedded_g3d_on (:555-567) touches PLL_CON2/PLL_CON0 of PLL_G3D
++ *    (0x1a240148 / 0x1a240140), G3D_CONFIGURATION/STATUS (+0x2380/+0x2384),
++ *    EMBEDDED_G3D_OUT (+0x2120), EMBEDDED_G3D_CONFIGURATION/STATUS
++ *    (+0x2100/+0x2104), all bit 0 (bit 1 for OUT). This probe only reads them.
++ *  - PLL_G3D lives in CMU_CMU at 0x1a240000 (cal-if/exynos9820/cmucal-sfr.c:7,
++ *    :64; DT clock-controller@0x1a240000, cruel/exynos9825.dts:5859-5861), not
++ *    in the G3D domain, so it can be read with the domain off; Linux's CAL
++ *    reads it from EL1 (cmucal-node.c:138). PLL_CON0 fields (cmucal-sfr.c:
++ *    2761-2765): ENABLE 31, STABLE 29, M [25:16], P [13:8], S [2:0]; input
++ *    26 MHz (fin_pll, cruel/exynos9825.dts:5854): rate = 26 MHz x M / (P << S).
++ *  - CMU_G3D at 0x18400000 is inside the domain (cmucal-sfr.c:22); its
++ *    PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_USER (+0x100, MUX_SEL bit 4,
++ *    cmucal-sfr.c:247, :3220) is read only after the domain reads as on.
++ *  - Mali register offsets: Linux panfrost_regs.h, as already used by this
++ *    tree's bsd/dev/d2s_gpu.c:57-76 (patch 0131) and by danstronics'
++ *    hakios.mali.c:439-455 (ext/danstronics_ios-s9plus-exynos/core/drivers/
++ *    gpu, APSL 2.0, same Bifrost register layout on the G72): GPU_ID 0x000,
++ *    L2_FEATURES 0x004, GPU_IRQ_RAWSTAT 0x020, GPU_STATUS 0x034,
++ *    SHADER_PRESENT 0x100/0x104, TILER_PRESENT 0x110, L2_PRESENT 0x120,
++ *    *_READY 0x140/0x150/0x160. All plain reads with no side effect (the raw
++ *    IRQ status is not cleared by reading it).
++ *  - GPU_ID: Mali-G76 is product 0x7211 (GPU_ID >> 16: arch 7.2, rev 1,
++ *    product 1); the d2s loader read 0x72110000 (r0p0) on the same SoC
++ *    (ios-d2s 1a3ad61, GPU_METAL_9825.md section 1a), and d2s_gpu.c:902
++ *    checks the same value. Cross-checks: danstronics reads 0x6221 on the
++ *    G72 (hakios.mali.c:258), hakios-a32 reports 0x74021000 on a G52 (its
++ *    README), the same encoding.
++ *  - Why the power check comes first: on the Exynos 9810 a read of the GPU
++ *    with the domain off is a bus hang, not an error (danstronics
++ *    hakios.mali.c:31-33), and a half-off domain led to an SError
++ *    (hakios.mali.c:65-68). Confirmed in shape by y2sios (stormtroopxyz/
++ *    y2sios, kernel/xnu/files/bsd/dev/redwood_mali.c, MIT; read on GitHub,
++ *    not cloned): it maps the Mali only after its PMU G3D status bit 0 reads
++ *    on, and its power-on (Exynos 990: PMU +0x2200/+0x2204, OUT bit 1,
++ *    delay 0x118, then CONFIGURATION bit 0 and a status wait, then SMC
++ *    0x82000410) has the same order as Samsung's 9820 CAL above.
++ *
++ * Interaction with patch 0131 (d2s_gpu.c): d2s_gpu_start() runs at every boot
++ * (boot-arg d2sgpu defaults to 1 there and only skips the self-test at 0) and
++ * soft-resets the GPU and powers its cores synchronously. So this probe does
++ * not use d2sgpu (which would make it run on every boot and next to those
++ * writes). With d1xmali >= 1, d2s_gpu_start() holds back entirely (it asks
++ * d1x_mali_holds_gpu()), so the readout is the GPU as S-Boot left it and the
++ * whole boot writes no GPU or G3D register. The D2SGPU user client then
++ * reports no GPU, as when the domain is off. d1xmali_hold=0 lets 0131 run as
++ * usual, and the probe then shows the state 0131 left.
++ *
++ * Stage 2 (powering the domain on) is NOT in this file. The PMU addresses
++ * and order are sourced (CAL above), but three things are not: whether the
++ * DTZPC restore SMC 0x82000410 with need_smc 0x18410204 reaches EL3 under
++ * this boot chain (S-Boot shim, Samsung's EL2) and with which third argument
++ * (danstronics passes 0 on the 9810, y2sios's redwood_mali.c 2 on the 990);
++ * what the G3D supply (S2MPS19 buck, raised through ACPM by Samsung's DVFS)
++ * does when the domain comes on cold (danstronics: S-Boot's rail hung the
++ * 9810); and the CMU_G3D restore that follows Linux's power-on
++ * (cal-if/pmucal_local.c:45-60). On d2s the domain was found on from S-Boot,
++ * so stage 1 first tells whether stage 2 is needed at all.
++ *
++ * Boot-args:
++ *   d1xmali=0         default: nothing (no thread, no mapping, 0131 as usual)
++ *   d1xmali=1         stage 1: after the delay, read and log the PMU G3D
++ *                     registers and PLL_G3D; only if the domain reads on
++ *                     (EMBEDDED_G3D and G3D status bit 0 set, configuration
++ *                     bit 0 set, twice 1 ms apart), read CMU_G3D's mux and
++ *                     the Mali's ID, features, present/ready masks, status
++ *                     and raw IRQ status. Higher values act as 1.
++ *   d1xmali_hold=0    do not hold 0131's d2s_gpu_start() back (default 1)
++ *   d1xmali_ms=MS     delay before the probe, 1000..120000 (default 20000)
++ * Log lines start with "D1X MALI:". Each block is announced before it is
++ * read, so a hang shows which block it was in the last pstore line.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++
++void d1x_mali_start(void);
++int d1x_mali_holds_gpu(void);
++
++#if defined(D2S)
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void IOSleep(unsigned int milliseconds);
++
++#define LOG(fmt, ...)   printf("D1X MALI: " fmt "\n", ##__VA_ARGS__)
++
++/* PMU (pmu_alive 0x15860000); the page holding the G3D registers */
++#define PMU_G3D_PAGE            0x15862000ull
++#define PMU_PAGE_SIZE           0x1000
++#define EMB_G3D_CONFIGURATION   0x100u   /* 0x15862100 */
++#define EMB_G3D_STATUS          0x104u   /* 0x15862104, bit 0 = on */
++#define EMB_G3D_OUT             0x120u   /* 0x15862120 */
++#define G3D_CONFIGURATION       0x380u   /* 0x15862380 */
++#define G3D_STATUS              0x384u   /* 0x15862384, bit 0 = on */
++#define PD_ON                   0x1u
++
++/* CMU_CMU (always on): PLL_G3D */
++#define CMU_CMU_PA              0x1a240000ull
++#define CMU_CMU_SIZE            0x1000
++#define PLL_CON0_PLL_G3D        0x140u
++#define PLL_CON2_PLL_G3D        0x148u
++#define FIN_KHZ                 26000u
++
++/* CMU_G3D (inside the domain) */
++#define CMU_G3D_PA              0x18400000ull
++#define CMU_G3D_SIZE            0x1000
++#define MUX_EMB_G3D_USER        0x100u   /* PLL_CON0_MUX_CLKCMU_EMBEDDED_G3D_USER */
++
++/* Mali (inside the domain) */
++#define MALI_PA                 0x18500000ull
++#define MALI_MAP_SIZE           0x1000  /* only GPU control (0x000-0x1ff) is read */
++#define GPU_ID                  0x000u
++#define L2_FEATURES             0x004u
++#define MMU_FEATURES            0x014u
++#define AS_PRESENT              0x018u
++#define JS_PRESENT              0x01cu
++#define GPU_IRQ_RAWSTAT         0x020u
++#define GPU_STATUS              0x034u
++#define SHADER_PRESENT_LO       0x100u
++#define SHADER_PRESENT_HI       0x104u
++#define TILER_PRESENT           0x110u
++#define L2_PRESENT              0x120u
++#define SHADER_READY_LO         0x140u
++#define TILER_READY             0x150u
++#define L2_READY                0x160u
++#define MALI_G76                0x7211u /* GPU_ID >> 16 */
++
++static int mali_level;
++static unsigned int mali_ms = 20000;
++
++static inline uint32_t
++rd(vm_offset_t base, uint32_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++/* Both PMU G3D domains report on and are asked to be on. */
++static bool
++domain_on(vm_offset_t pmu)
++{
++	return (rd(pmu, EMB_G3D_STATUS) & PD_ON) && (rd(pmu, EMB_G3D_CONFIGURATION) & PD_ON) &&
++	       (rd(pmu, G3D_STATUS) & PD_ON) && (rd(pmu, G3D_CONFIGURATION) & PD_ON);
++}
++
++static void
++show_pmu(vm_offset_t pmu, const char *when)
++{
++	uint32_t st = rd(pmu, EMB_G3D_STATUS);
++
++	LOG("PMU %s: EMBEDDED_G3D cfg %#x status %#x ([3:0] %#x, bit0 %u) out %#x; G3D cfg %#x status %#x",
++	    when, rd(pmu, EMB_G3D_CONFIGURATION), st, st & 0xf, st & PD_ON, rd(pmu, EMB_G3D_OUT),
++	    rd(pmu, G3D_CONFIGURATION), rd(pmu, G3D_STATUS));
++}
++
++static void
++show_pll(void)
++{
++	vm_offset_t cmu;
++	uint32_t con0, con2, m, p, s;
++
++	LOG("reading PLL_G3D (CMU_CMU %#llx +%#x/+%#x)", CMU_CMU_PA, PLL_CON0_PLL_G3D, PLL_CON2_PLL_G3D);
++	cmu = ml_io_map(CMU_CMU_PA, CMU_CMU_SIZE);
++	if (!cmu) {
++		LOG("CMU_CMU map failed, PLL_G3D not read");
++		return;
++	}
++	con0 = rd(cmu, PLL_CON0_PLL_G3D);
++	con2 = rd(cmu, PLL_CON2_PLL_G3D);
++	m = (con0 >> 16) & 0x3ff;
++	p = (con0 >> 8) & 0x3f;
++	s = con0 & 0x7;
++	LOG("PLL_G3D CON0 %#x (enable %u stable %u mux_sel %u M %u P %u S %u) CON2 %#x -> %u kHz",
++	    con0, (con0 >> 31) & 1, (con0 >> 29) & 1, (con0 >> 4) & 1, m, p, s, con2,
++	    p ? (uint32_t)(((uint64_t)FIN_KHZ * m) / ((uint64_t)p << s)) : 0);
++}
++
++static void
++show_gpu(void)
++{
++	vm_offset_t cmu_g3d, mali;
++	uint32_t id;
++
++	LOG("reading CMU_G3D %#llx +%#x", CMU_G3D_PA, MUX_EMB_G3D_USER);
++	cmu_g3d = ml_io_map(CMU_G3D_PA, CMU_G3D_SIZE);
++	if (cmu_g3d) {
++		uint32_t mux = rd(cmu_g3d, MUX_EMB_G3D_USER);
++		LOG("CMU_G3D MUX_CLKCMU_EMBEDDED_G3D_USER %#x (mux_sel %u busy %u)", mux, (mux >> 4) & 1,
++		    (mux >> 7) & 1);
++	} else {
++		LOG("CMU_G3D map failed");
++	}
++
++	LOG("reading Mali GPU control at %#llx", MALI_PA);
++	mali = ml_io_map(MALI_PA, MALI_MAP_SIZE);
++	if (!mali) {
++		LOG("Mali map failed");
++		return;
++	}
++	id = rd(mali, GPU_ID);
++	LOG("GPU_ID %#x (product %#x r%up%u status %u): %s", id, id >> 16, (id >> 12) & 0xf,
++	    (id >> 4) & 0xff, id & 0xf, (id >> 16) == MALI_G76 ? "Mali-G76" : "NOT the expected Mali-G76 0x7211");
++	LOG("L2_FEATURES %#x MMU_FEATURES %#x AS_PRESENT %#x JS_PRESENT %#x",
++	    rd(mali, L2_FEATURES), rd(mali, MMU_FEATURES), rd(mali, AS_PRESENT), rd(mali, JS_PRESENT));
++	LOG("SHADER_PRESENT %#x_%08x TILER_PRESENT %#x L2_PRESENT %#x",
++	    rd(mali, SHADER_PRESENT_HI), rd(mali, SHADER_PRESENT_LO), rd(mali, TILER_PRESENT),
++	    rd(mali, L2_PRESENT));
++	LOG("READY shader %#x tiler %#x l2 %#x; GPU_STATUS %#x GPU_IRQ_RAWSTAT %#x",
++	    rd(mali, SHADER_READY_LO), rd(mali, TILER_READY), rd(mali, L2_READY),
++	    rd(mali, GPU_STATUS), rd(mali, GPU_IRQ_RAWSTAT));
++}
++
++static void
++mali_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	vm_offset_t pmu;
++
++	IOSleep(mali_ms);
++	LOG("stage 1 (read only) after %u ms; 0131 %s", mali_ms,
++	    d1x_mali_holds_gpu() ? "held back (GPU as S-Boot left it)" : "ran as usual");
++	LOG("reading PMU %#llx (EMBEDDED_G3D +%#x, G3D +%#x)", PMU_G3D_PAGE, EMB_G3D_CONFIGURATION,
++	    G3D_CONFIGURATION);
++	pmu = ml_io_map(PMU_G3D_PAGE, PMU_PAGE_SIZE);
++	if (!pmu) {
++		LOG("PMU map failed, nothing read");
++		return;
++	}
++	show_pmu(pmu, "first");
++	show_pll();
++	if (!domain_on(pmu)) {
++		LOG("G3D power domain OFF (or partly): GPU and CMU_G3D not touched; done");
++		return;
++	}
++	IOSleep(1);
++	show_pmu(pmu, "1 ms later");
++	if (!domain_on(pmu)) {
++		LOG("G3D power domain changed within 1 ms: GPU and CMU_G3D not touched; done");
++		return;
++	}
++	show_gpu();
++	show_pmu(pmu, "after");
++	LOG("done, nothing written");
++}
++
++/* Called by d2s_gpu_start() (0131): nonzero = do not touch the GPU this boot. */
++int
++d1x_mali_holds_gpu(void)
++{
++	int level = 0, hold = 1;
++
++	if (!PE_parse_boot_argn("d1xmali", &level, sizeof(level)) || level <= 0) {
++		return 0;
++	}
++	(void)PE_parse_boot_argn("d1xmali_hold", &hold, sizeof(hold));
++	return hold != 0;
++}
++
++void
++d1x_mali_start(void)
++{
++	thread_t th;
++
++	if (!PE_parse_boot_argn("d1xmali", &mali_level, sizeof(mali_level)) || mali_level <= 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("d1xmali_ms", &mali_ms, sizeof(mali_ms));
++	if (mali_ms < 1000) {
++		mali_ms = 1000;
++	}
++	if (mali_ms > 120000) {
++		mali_ms = 120000;
++	}
++	if (kernel_thread_start(mali_thread, NULL, &th) != KERN_SUCCESS) {
++		LOG("no thread");
++		return;
++	}
++	thread_deallocate(th);
++}
++
++#else /* !D2S */
++
++int
++d1x_mali_holds_gpu(void)
++{
++	return 0;
++}
++
++void
++d1x_mali_start(void)
++{
++}
++
++#endif /* D2S */
+diff --git a/bsd/dev/d2s_gpu.c b/bsd/dev/d2s_gpu.c
+index a697ac9..6e297d0 100644
+--- a/bsd/dev/d2s_gpu.c
++++ b/bsd/dev/d2s_gpu.c
+@@ -49,6 +49,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
+ extern vm_map_address_t phystokv(uint64_t pa);
+ extern void IOSleep(unsigned int milliseconds);
++extern int d1x_mali_holds_gpu(void);	/* d1x_mali.c: boot-arg d1xmali */
+ 
+ #define GPU_PA			0x18500000ull
+ #define GPU_SIZE		0x5000
+@@ -875,6 +876,10 @@ d2s_gpu_start(void)
+ 	int test = 1;
+ 	(void)PE_parse_boot_argn("d2sgpu", &test, sizeof(test));
+ 
++	if (d1x_mali_holds_gpu()) {
++		printf("D2S GPU: held back for the d1xmali read-only probe (d1x_mali.c)\n");
++		return;
++	}
+ 	vm_offset_t pmu = ml_io_map(PMU_PA, 0x1000);
+ 	if (!pmu || !(*(volatile uint32_t *)(pmu + 0x104) & 1)) {
+ 		printf("D2S GPU: power domain off, not touching the GPU\n");
