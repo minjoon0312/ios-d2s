@@ -1,0 +1,67 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index f813f12..7f0562e 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -456,9 +456,62 @@ extern bool d2s_files_wait(uint32_t ms);
+  * file install (d2s_files.c) and leaves the variable out when the library
+  * is missing, so the program still starts without it.
+  */
++/*
++ * 0162 (after wardevsa/ios-a5xelte herolte 0253 + 0325): programs that must not
++ * start. d1x boot v9a: the speech synthesizer audio units abort as PlugInKit
++ * starts them and are relaunched all session (SiriTTSSynthesizerAU 24x,
++ * MacinTalkAUSP 24x, KonaSynthesizer 23x), each a process launch and a crash
++ * report on a CPU-drawn UI. exec fails with EPERM; launchd/PlugInKit give up.
++ * Boot-arg d2snoexec=name,name REPLACES the default list (d2snoexec=- : none).
++ */
++static bool
++d2s_noexec(const char *base)
++{
++	static char list[200];
++	static int init;
++	if (!init) {
++		init = 1;
++		if (!PE_parse_boot_argn("d2snoexec", list, sizeof(list))) {
++			strlcpy(list, "SiriTTSSynthesizerAU,KonaSynthesizer,MacinTalkAUSP", sizeof(list));
++		}
++	}
++	size_t n = strlen(base);
++	if (n == 0 || list[0] == '\0' || (list[0] == '-' && list[1] == '\0')) {
++		return false;
++	}
++	for (const char *t = list; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && strncmp(t, base, n) == 0) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
+ static int
+ d2s_exec_env(struct image_params *imgp, int ptr_size)
+ {
++	{
++		/* the first string is "executable_path=<path>": its file name (0162) */
++		const char *base = imgp->ip_strings;
++		for (const char *c = imgp->ip_strings; *c; c++) {
++			if (*c == '/' || (*c == '=' && base == imgp->ip_strings)) {
++				base = c + 1;
++			}
++		}
++		if (d2s_noexec(base)) {
++			static unsigned refused;
++			if (refused++ < 20) {
++				printf("D2S NOEXEC: %s refused (d2snoexec)\n", base);
++			}
++			return EPERM;
++		}
++	}
+ 	static char rule[200];
+ 	static size_t n;		/* length of NAME */
+ 	static int parsed;		/* 0 not yet, 1 no rule, 2 rule */
