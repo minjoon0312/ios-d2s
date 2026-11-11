@@ -1,0 +1,63 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 17fbaf1..b4d913c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #if defined(D2S)
+ static uint32_t d2s_fb_scale = 1;       /* boot-arg d2sfb_scale, see d2s_present_scaled */
+ static bool d2s_fb_cleared;
++static void d2s_panel_written(void);    /* 0156: a write outside the presents (defined with the row sums) */
+ /* 0141 boot-args (cheaper presents on d1x); d2sfb_vsync_hz is read in AppleCLCD::start() */
+ static uint32_t d2s_fb_mask;            /* d2sfb_mask: 0 frame-done wait, 1 TE trigger mask */
+ static uint32_t d2s_fb_spin;            /* d2sfb_spin: 1 = the old 100 us poll in those waits */
+@@ -317,7 +318,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+ #if defined(D2S)
+-		step = 7;       /* d2s: no CPU fade while the panel is off */
++		/*
++		 * 0156: d2s skipped the fade entirely, so "display off" (power button, auto-lock) left
++		 * the last frame on the panel: the phone went to sleep but looked awake, and the next
++		 * press (a wake) read as a second press. Write black once instead, no CPU fade: step 6
++		 * is that black pass (AMOLED black pixels are off). The panel stays powered.
++		 */
++		if (step < 6) {
++			step = 6;
++		}
+ #endif
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+@@ -331,6 +340,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++#if defined(D2S)
++			d2s_panel_written();    /* 0156: 0141's row sums no longer match the panel */
++#endif
+ 		}
+ 		fb->rearmVsync(sender);
+ 		return;
+@@ -820,6 +832,11 @@ static struct d2s_row_sum {
+ 	uint64_t lo, hi;
+ } d2s_sums[D2S_SUM_ROWS];
+ static bool d2s_nh_ready, d2s_sums_valid, d2s_check_failed;
++static void
++d2s_panel_written(void)
++{
++	d2s_sums_valid = false;
++}
+ static uint32_t d2s_sums_width;         /* source pixels per row the sums are for */
+ static uint8_t *d2s_check;              /* d2sfb_dirty=2: each row as last copied */
+ static size_t d2s_check_size;
+@@ -1405,6 +1422,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++#if defined(D2S)
++				if (!off) {
++					d2s_panel_written();    /* 0156: on: the redraw copies every row */
++				}
++#endif
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
