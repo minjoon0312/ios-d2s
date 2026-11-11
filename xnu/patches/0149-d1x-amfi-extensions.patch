@@ -1,0 +1,32 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index d40a2c9..ce3ceea 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -401,6 +401,8 @@ static mac_policy_handle_t sweet_amfi_mac_handle;
+ #define DYLD_ALLOW_FAILED_INSERTION	0x20ull
+ #define DYLD_ALLOW_INTERPOSING		0x40ull
+ #define AMFI_OP_DYLD_POLICY_SELF	0x5a
++#define AMFI_OP_BOOT_ARGS_STATE		0x60
++#define AMFI_BOOT_ARGS_EXTENSIONS_OK	0x86ull
+ 
+ static int
+ d2s_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+@@ -408,6 +410,18 @@ d2s_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
+ 	uint64_t a[2];
+ 	uint64_t allow = DYLD_ALLOW_AT_PATH | DYLD_ALLOW_PATH_VARS | DYLD_ALLOW_FALLBACK_PATHS |
+ 	    DYLD_ALLOW_PRINT_VARS | DYLD_ALLOW_FAILED_INSERTION | DYLD_ALLOW_INTERPOSING;
++	/*
++	 * d1x: call 0x60 reports AMFI's boot-arg state. Unless it has one of
++	 * the bits 0x86, ExtensionKit wants AMFI's IOKit service (absent here)
++	 * to check /System/Library/xpc/extensions.plist, never reads it, and
++	 * LaunchServices refuses every app extension: no wallpaper renderers,
++	 * widgets or keyboards. (Fact from the Galaxy S7 port, same iOS build:
++	 * plug-ins went from 1 to 516.) Answered with a u64, like 0x5a.
++	 */
++	if (call == AMFI_OP_BOOT_ARGS_STATE) {
++		uint64_t state = AMFI_BOOT_ARGS_EXTENSIONS_OK;
++		return copyout(&state, arg, sizeof(state));
++	}
+ 	if (call != AMFI_OP_DYLD_POLICY_SELF) {
+ 		return ENOPOLICY;
+ 	}

@@ -53,7 +53,12 @@ def d22ap_product(path=D22AP_ADT):
     root, _ = adt.parse(open(path, 'rb').read())
     for c in root.children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
-            return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+            props = [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
+            # d1x: the D22AP panel is P3, so iOS renders wallpapers and WebKit into 10-bit
+            # w30r/b3a8 surfaces that the CPU present path cannot show (black). sRGB keeps
+            # them BGRA8 (Galaxy S7 port finding). D2S_GAMUT=P3 restores the original.
+            gamut = os.environ.get('D2S_GAMUT', 'sRGB').encode() + b'\0'
+            return [(k, gamut if k == 'artwork-display-gamut' else v) for k, v in props]
     raise SystemExit(f'{path}: no /product node')
 
 u32 = lambda *v: struct.pack('<%dI' % len(v), *v)

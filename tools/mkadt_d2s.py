@@ -8,7 +8,7 @@ import adt
 import mkadt
 
 DRAM_BASE = 0x900000000
-DRAM_SIZE = 0x80000000  # d1x: 2 GiB = the whole 0x900000000 bank (was 512 MiB; iOS ran with 512 MB)
+DRAM_SIZE = int(os.environ.get('D2S_DRAM_SIZE', '0x20000000'), 0)  # 512 MiB default; 2 GiB (0x80000000) panics in pmap_enter_pte (v7b), see HANDOFF
 FB_PHYS, FB_W, FB_H = 0xca000000, 1080, 2280  # d1x (Note 10 5G)
 TIMEBASE = 26000000
 
@@ -82,6 +82,11 @@ def build(canvas=(FB_W, FB_H)):
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
     set_prop(chosen, 'firmware-version', mkadt.cstr('d2s-entry'))
+    # lsd (app registration) waits forever for the Bluetooth MAC to compute
+    # the UDID once /Applications is present (Galaxy S7 port, same lineage).
+    # Locally administered (0x02) placeholder addresses.
+    for name, last in (('wifi0', 1), ('bluetooth0', 2), ('ethernet0', 3)):
+        set_prop(chosen, f'mac-address-{name}', bytes((0x02, 0x4e, 0x31, 0x30, 0x00, last)))
     set_prop(chosen, 'system-firmware-version', mkadt.cstr('d2s-entry'))
 
     cpus = child(root, 'cpus')
