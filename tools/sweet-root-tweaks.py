@@ -192,6 +192,15 @@ def audio(root):
         os.makedirs(dst_dir, exist_ok=True)
         shutil.move(src, dst_dir)
         print('VirtualAudio.plugin disabled')
+    # No Bluetooth here; on the S7 port (wardevsa/ios-a5xelte herolte) this
+    # plug-in alone kept idle CPU above 300 % of 800 % (research/COMMUNITY.md).
+    for bt in glob.glob(os.path.join(root, '*/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver')) + \
+            glob.glob(os.path.join(root, 'Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver')):
+        dst = os.path.join(os.path.dirname(os.path.dirname(bt)), 'HAL.disabled')
+        os.makedirs(dst, exist_ok=True)
+        if not os.path.exists(os.path.join(dst, os.path.basename(bt))):
+            shutil.move(bt, dst)
+            print('BTAudioHALPlugin disabled', os.path.relpath(bt, root))
     for conf in glob.glob(os.path.join(root, 'System/Library/Frameworks/MediaToolbox.framework/*/SubServerConfiguration.plist')):
         st = os.stat(conf)
         data = load(conf)

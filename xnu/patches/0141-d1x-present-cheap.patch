@@ -1,0 +1,694 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ebb1f9f..4fb261e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -25,7 +25,8 @@
+  * Everything else is accepted and logged once.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
++ * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer (d2s:
++ * sweetfb_hz unless d2sfb_vsync_hz=60, see 0141 below) that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -40,6 +41,11 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #if defined(D2S)
+ static uint32_t d2s_fb_scale = 1;       /* boot-arg d2sfb_scale, see d2s_present_scaled */
+ static bool d2s_fb_cleared;
++/* 0141 boot-args (cheaper presents on d1x); d2sfb_vsync_hz is read in AppleCLCD::start() */
++static uint32_t d2s_fb_mask;            /* d2sfb_mask: 0 frame-done wait, 1 TE trigger mask */
++static uint32_t d2s_fb_spin;            /* d2sfb_spin: 1 = the old 100 us poll in those waits */
++static uint32_t d2s_fb_dirty = 1;       /* d2sfb_dirty: 0 all rows, 1 changed rows, 2 = 1 + check */
++static uint32_t d2s_fb_log = 3;         /* d2sfb_log: bit 0 stats every 10 s, bit 1 touch latency */
+ #endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+@@ -105,8 +111,12 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
++	bool                fVsyncTied;     /* vsync at the present rate (d2sfb_vsync_hz < 60) */
++	uint64_t            fVsyncPeriod;   /* tied: timebase ticks per vsync */
++	uint64_t            fVsyncNext;     /* tied: deadline of the next vsync */
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	void rearmVsync(IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -128,6 +138,7 @@ public:
+ 	IOLock       *fPresentLock;   /* one panel copy at a time */
+ 	uint64_t      fLastPresent;   /* mach_absolute_time of the last copy */
+ 	uint64_t      fMinGap;        /* 1/hz in timebase ticks */
++	bool          fTickPresented; /* tied vsync: this flush period already has its present */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -229,11 +240,41 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fMinGap = 26000000ULL / (hz == 0 ? 60 : hz);     /* 26 MHz timebase */
++#if defined(D2S)
++	/*
++	 * 0141 d2sfb_vsync_hz (default 0 = sweetfb_hz): vsync notifications at the rate frames
++	 * are shown, so a window server that follows them renders no frame that is never shown.
++	 * CoreAnimation follows them only with CA_FORCE_TIMER=1 on the iPhone X chip id (y2sios
++	 * README, iOS 16.5); without it nothing registered for them in the d1x v4 boot log and
++	 * what changes is the throttle in swap() (one present per period, so exactly
++	 * sweetfb_hz). 60 keeps the fixed 60 Hz timer and the old throttle.
++	 */
++	uint32_t vhz = 0;
++	PE_parse_boot_argn("d2sfb_vsync_hz", &vhz, sizeof(vhz));
++	vhz = vhz != 0 ? vhz : hz;
++	if (vhz != 0 && vhz < 60) {
++		fVsyncTied = true;
++		nanoseconds_to_absolutetime(1000000000ULL / vhz, &fVsyncPeriod);
++		fFlushTicks = (hz == 0 || hz >= vhz) ? 1 : vhz / hz;
++	}
++	PE_parse_boot_argn("d2sfb_mask", &d2s_fb_mask, sizeof(d2s_fb_mask));
++	PE_parse_boot_argn("d2sfb_spin", &d2s_fb_spin, sizeof(d2s_fb_spin));
++	PE_parse_boot_argn("d2sfb_dirty", &d2s_fb_dirty, sizeof(d2s_fb_dirty));
++	PE_parse_boot_argn("d2sfb_log", &d2s_fb_log, sizeof(d2s_fb_log));
++	IOLog("SWEET FB: 0141 mask %u spin %u dirty %u vsync %u Hz %s, flush every %u, log %u\n",
++	    d2s_fb_mask, d2s_fb_spin, d2s_fb_dirty, fVsyncTied ? vhz : 60U,
++	    fVsyncTied ? "tied" : "fixed", fFlushTicks, d2s_fb_log);
++#endif
+ 	fPresentLock = IOLockAlloc();
+ 	if (fPresentLock == NULL) {
+ 		return false;
+ 	}
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	if (fVsyncTied) {
++		fVsyncNext = mach_absolute_time() + fVsyncPeriod;
++		fVsync->wakeAtTime(fVsyncNext);
++	} else {
++		fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -271,6 +312,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
++		fb->fTickPresented = false;     /* tied: the first swap after power-on shows at once */
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+@@ -280,7 +322,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->rearmVsync(sender);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -292,12 +334,36 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fDirty = false;
+ 		}
+ 	}
++	if (fb->fVsyncTied && (count % fb->fFlushTicks) == 0) {
++		/* New flush period: a flush takes its one present, else the next swap may. */
++		fb->fTickPresented = rec != NULL;
++	}
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	fb->rearmVsync(sender);
++}
++
++/*
++ * Fixed 60 Hz timer: re-armed 16.667 ms after this callback, as before. Tied (0141): on a
++ * fixed cadence from the previous deadline, so a present inside the callback does not stretch
++ * the period (it used to: every flush tick was late by the copy and the frame-done wait).
++ */
++void
++AppleCLCD::rearmVsync(IOTimerEventSource *sender)
++{
++	if (!fVsyncTied) {
++		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	fVsyncNext += fVsyncPeriod;
++	if (fVsyncNext <= now) {
++		fVsyncNext = now + fVsyncPeriod;        /* late by a whole period: skip, no burst */
++	}
++	sender->wakeAtTime(fVsyncNext);
+ }
+ 
+ void
+@@ -339,15 +405,12 @@ get32(const uint8_t *p, uint32_t off)
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ static vm_offset_t sweet_fb_decon;
+ 
++#if !defined(D2S)
+ static void
+ sweet_fb_wait_frame_done(void)
+ {
+ 	if (sweet_fb_decon == 0) {
+-#if defined(D2S)
+-		sweet_fb_decon = ml_io_map(D2S_DECON_PHYS, 0x1000);
+-#else
+ 		sweet_fb_decon = ml_io_map(0x12860000, 0x1000);
+-#endif
+ 		if (sweet_fb_decon == 0) {
+ 			return;
+ 		}
+@@ -359,7 +422,150 @@ sweet_fb_wait_frame_done(void)
+ 		IODelay(100);
+ 	}
+ }
+-#endif
++#else /* D2S: DECON_F of the Exynos 9820/9825 */
++/*
++ * 0141: the DECON wait around the panel copy, boot-arg d2sfb_mask.
++ *
++ * 0 (default), the 0124 order: clear frame-done, wait for the next one, copy (the copy then
++ *   runs ahead of the next TE-started fetch). Now capped at one frame (it was 200 polls, 20 ms
++ *   or more) and polled with IOSleep(1). IODelay(100) did not spin on this port either:
++ *   SweetCPU registers powergate_latency 0, so cpu_idle_latency is 0, ml_delay_should_spin()
++ *   is false and every IODelay(100) was a 100 us timer sleep: up to 200 wakeups per present
++ *   (about 80 on average, estimate). d2sfb_spin=1 polls with IODelay(100) again, capped.
++ * 1, Samsung's command-mode update order, no frame-done wait at all: the previous shadow
++ *   update has latched, mask the TE trigger, wait until a fetch that started before the
++ *   mask has ended (DECON idle), copy, request the shadow update, unmask. The next TE then
++ *   fetches the whole new frame: no tearing. Off until it is tested on the phone.
++ *
++ * Registers and order: CruelKernel/samsung-exynos9820 branch cruel-HVJ5-v5.3,
++ * drivers/video/fbdev/exynos/dpu20/ (cal_9820/regs-decon.h, cal_9820/decon_reg.c,
++ * decon_core.c, win_update.c); the line numbers below are from that tree. Only 0x000 (read),
++ * 0x060 and 0x070 are used in mode 1: no interrupt source is enabled (XNU's GIC setup,
++ * pe_fiq.c, leaves S-Boot's SPI enables as they are).
++ */
++#define D2S_FRAME_US                    16667           /* s6e3fa7, command mode, 60 Hz TE */
++#define D2S_IDLE_US                     20000           /* a 1080x2280 fetch takes ~12.8 ms */
++#define DECON_GLOBAL_CONTROL            0x000           /* regs-decon.h:87 */
++#define DECON_IDLE_STATUS               (1u << 5)       /* :99, decon_reg.c:82-91 */
++#define DECON_INTERRUPT_ENABLE          0x040           /* :116 */
++#define DECON_FRAME_DONE_INT_EN         (1u << 13)      /* :119 */
++#define DECON_INT_EN                    (1u << 0)       /* :122 */
++#define DECON_INTERRUPT_PENDING         0x04c           /* :131, write 1 to clear (decon_reg.c:2137) */
++#define DECON_FRAME_DONE_INT_PEND       (1u << 13)      /* :134 */
++#define DECON_SHADOW_REG_UPDATE_REQ     0x060           /* :142, non-zero until latched */
++#define DECON_SHADOW_UPDATE_GLOBAL      (1u << 31)      /* :143 */
++#define DECON_SHADOW_UPDATE_ALL_WIN     0x3fu           /* :146, SHADOW_REG_UPDATE_REQ_FOR_DECON */
++#define DECON_HW_SW_TRIG_CONTROL        0x070           /* :151 */
++#define DECON_HW_TRIG_MASK_DECON        (1u << 4)       /* :163 */
++#define DECON_HW_TRIG_EN                (1u << 0)       /* :166 */
++
++static struct {
++	uint64_t start, swaps, waitSum, waitMax, copySum, copyMax;
++	uint32_t presents, unchanged, rows, polls, timeouts, races, misses;
++} d2s_st;                               /* 10 s window, d2sfb_log bit 0 */
++
++static volatile uint32_t *
++d2s_decon_reg(uint32_t off)
++{
++	return (volatile uint32_t *)(sweet_fb_decon + off);
++}
++
++/* Poll until (reg & bits) == want, at most limitUS: IOSleep(1) (d2sfb_spin=1: IODelay(100)). */
++static bool
++d2s_decon_poll(uint32_t off, uint32_t bits, uint32_t want, uint32_t limitUS)
++{
++	uint64_t t0 = mach_absolute_time(), now = t0, limit;
++
++	nanoseconds_to_absolutetime((uint64_t)limitUS * 1000, &limit);
++	for (;;) {
++		if ((*d2s_decon_reg(off) & bits) == want) {
++			return true;
++		}
++		if (now - t0 >= limit) {
++			d2s_st.timeouts++;
++			return false;
++		}
++		if (d2s_fb_spin) {
++			IODelay(100);
++		} else {
++			IOSleep(1);
++		}
++		d2s_st.polls++;
++		now = mach_absolute_time();
++	}
++}
++
++/* decon_reg_set_trigger(), HW (TE) trigger branch, decon_reg.c:1943-1961: bits 0 and 4 only. */
++static void
++d2s_decon_trigger(bool on)
++{
++	volatile uint32_t *t = d2s_decon_reg(DECON_HW_SW_TRIG_CONTROL);
++	uint32_t v = *t & ~(DECON_HW_TRIG_EN | DECON_HW_TRIG_MASK_DECON);
++
++	*t = v | (on ? DECON_HW_TRIG_EN : DECON_HW_TRIG_MASK_DECON);
++	(void)*t;       /* read back: the write has reached DECON before IDLE_STATUS is read */
++}
++
++/* Before the panel copy, fPresentLock held. */
++static void
++d2s_decon_begin(void)
++{
++	if (sweet_fb_decon == 0) {
++		sweet_fb_decon = ml_io_map(D2S_DECON_PHYS, 0x1000);
++		if (sweet_fb_decon == 0) {
++			return;
++		}
++		IOLog("SWEET FB: DECON control 0x%x int_en 0x%x shadow 0x%x trig 0x%x\n",
++		    *d2s_decon_reg(DECON_GLOBAL_CONTROL), *d2s_decon_reg(DECON_INTERRUPT_ENABLE),
++		    *d2s_decon_reg(DECON_SHADOW_REG_UPDATE_REQ), *d2s_decon_reg(DECON_HW_SW_TRIG_CONTROL));
++		if (d2s_fb_mask == 0) {
++			*d2s_decon_reg(DECON_INTERRUPT_ENABLE) |= DECON_FRAME_DONE_INT_EN | DECON_INT_EN;
++		}
++	}
++	if (d2s_fb_mask == 0) {
++		*d2s_decon_reg(DECON_INTERRUPT_PENDING) = DECON_FRAME_DONE_INT_PEND;
++		(void)d2s_decon_poll(DECON_INTERRUPT_PENDING, DECON_FRAME_DONE_INT_PEND,
++		    DECON_FRAME_DONE_INT_PEND, D2S_FRAME_US);
++		return;
++	}
++	/*
++	 * decon_reg_wait_update_done_and_mask() (decon_reg.c:1971-1998), the first step of
++	 * __decon_update_regs (decon_core.c:2128): the request bits clear at the frame start that
++	 * takes them, so our previous frame has been fetched at least once. Samsung waits for the
++	 * whole register; only the bits we request here, in case S-Boot left another one set.
++	 */
++	(void)d2s_decon_poll(DECON_SHADOW_REG_UPDATE_REQ,
++	    DECON_SHADOW_UPDATE_ALL_WIN | DECON_SHADOW_UPDATE_GLOBAL, 0, 2 * D2S_FRAME_US);
++	d2s_decon_trigger(false);
++	/*
++	 * The mask stops new fetches, not one already running (one runs ~12.8 of every 16.7 ms).
++	 * Samsung waits for IDLE_STATUS before changing what a transfer reads: win_update.c
++	 * 390-394 ("previous frame data must be finished to transfer") and 562-568 ("without DMA
++	 * operation"), both after the mask above.
++	 */
++	(void)d2s_decon_poll(DECON_GLOBAL_CONTROL, DECON_IDLE_STATUS, DECON_IDLE_STATUS, D2S_IDLE_US);
++}
++
++/* After the panel copy, fPresentLock held. */
++static void
++d2s_decon_end(void)
++{
++	if (sweet_fb_decon == 0 || d2s_fb_mask == 0) {
++		return;
++	}
++	if (!(*d2s_decon_reg(DECON_GLOBAL_CONTROL) & DECON_IDLE_STATUS)) {
++		d2s_st.races++;         /* busy now: a fetch started while masked (or never idled) */
++	}
++	/*
++	 * The end of __decon_update_regs (decon_core.c:2196-2198): all-window shadow update
++	 * request (decon_reg.c:1896-1903), then decon_reg_start(), which for a DECON that is
++	 * already running is decon_reg_update_req_and_unmask() (decon_reg.c:1828-1848, 1963-1969).
++	 */
++	*d2s_decon_reg(DECON_SHADOW_REG_UPDATE_REQ) |= DECON_SHADOW_UPDATE_ALL_WIN | DECON_SHADOW_UPDATE_GLOBAL;
++	d2s_decon_trigger(true);
++}
++#endif /* D2S */
++#endif /* DREAMLTE */
+ 
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+@@ -378,10 +584,16 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	uint64_t now = mach_absolute_time();
+-	bool copyNow = !fPowerOff && now - fLastPresent >= fMinGap;
++	/*
++	 * Tied vsync (0141): the first swap of each flush period is shown at once, later ones
++	 * at the period's tick. With fMinGap, a frame paced by this vsync that came a little
++	 * sooner after the previous one than 1/hz waited for the next tick.
++	 */
++	bool copyNow = !fPowerOff && (fVsyncTied ? !fTickPresented : now - fLastPresent >= fMinGap);
+ 	if (copyNow) {
+ 		fDirty = false;
+ 		fLastPresent = now;
++		fTickPresented = true;
+ 	}
+ 	IOLockUnlock(fLock);
+ 	if (copyNow) {
+@@ -443,6 +655,127 @@ d2s_build_runs(uint32_t pw, uint32_t lw, uint64_t ix)
+ 	return true;
+ }
+ 
++/*
++ * 0141 d2sfb_dirty: copy only the panel rows whose source row changed since it was last
++ * copied. Each source row is summed with NH (Black, Halevi, Krawczyk, Krovetz, Rogaway,
++ * "UMAC: Fast and Secure Message Authentication", CRYPTO '99): the row as 64-bit words
++ * m[], zero-padded to whole pairs, H = sum of (m[2i] + k[2i]) * (m[2i+1] + k[2i+1]), adds
++ * mod 2^64, products and sum mod 2^128. NH is 2^-w almost universal (w = 64 here): for two
++ * different rows of the same length at most a 2^-64 fraction of the keys k give the same
++ * H, so with a key drawn at boot a changed row is missed with probability <= 2^-64. Costs
++ * 72 KB (sums and key) instead of a 10 MB copy of the last frame (XNU has 512 MiB), and
++ * each row is read once: an unchanged row costs that read and one 64x64->128 multiply per
++ * 16 bytes; a changed row is copied out of the cache right after it was summed.
++ * d2sfb_dirty=2 also keeps that 10 MB copy and checks every skipped row against it
++ * ("misses" in the stats, expected 0). Exact only while nothing but these copies writes
++ * the panel memory: the kernel console must be muted (sweetfb_noconsole/a5fb_noconsole,
++ * else every row is copied as before), and every other panel write clears d2s_sums_valid.
++ */
++#define D2S_SUM_ROWS    4096            /* panel rows */
++#define D2S_NH_KEYS     1024            /* 64-bit key words: rows up to 2048 pixels */
++static uint64_t d2s_nh_key[D2S_NH_KEYS];
++static struct d2s_row_sum {
++	uint64_t lo, hi;
++} d2s_sums[D2S_SUM_ROWS];
++static bool d2s_nh_ready, d2s_sums_valid, d2s_check_failed;
++static uint32_t d2s_sums_width;         /* source pixels per row the sums are for */
++static uint8_t *d2s_check;              /* d2sfb_dirty=2: each row as last copied */
++static size_t d2s_check_size;
++static uint32_t d2s_rows;               /* panel rows this present copied */
++static bool d2s_full;                   /* this present wrote the panel without row sums */
++
++static void
++d2s_row_nh(const uint32_t *px, uint32_t n, struct d2s_row_sum *out)
++{
++	const uint64_t *k = d2s_nh_key;
++	__uint128_t a = 0, b = 0;
++	uint32_t i = 0, j = 0;
++
++	for (; i + 8 <= n; i += 8, j += 4) {    /* 32 bytes: two pairs, two sums */
++		uint64_t m0, m1, m2, m3;
++		memcpy(&m0, px + i, 8);
++		memcpy(&m1, px + i + 2, 8);
++		memcpy(&m2, px + i + 4, 8);
++		memcpy(&m3, px + i + 6, 8);
++		a += (__uint128_t)(m0 + k[j]) * (m1 + k[j + 1]);
++		b += (__uint128_t)(m2 + k[j + 2]) * (m3 + k[j + 3]);
++	}
++	if (i < n) {                            /* 1-7 pixels left: zero-padded to whole pairs */
++		uint32_t tail[8] = { 0 };
++		memcpy(tail, px + i, (size_t)(n - i) * 4);
++		for (uint32_t t = 0; t < n - i; t += 4, j += 2) {
++			uint64_t m0, m1;
++			memcpy(&m0, tail + t, 8);
++			memcpy(&m1, tail + t + 2, 8);
++			a += (__uint128_t)(m0 + k[j]) * (m1 + k[j + 1]);
++		}
++	}
++	a += b;
++	out->lo = (uint64_t)a;
++	out->hi = (uint64_t)(a >> 64);
++}
++
++/* May this present skip rows of n source pixels? Sets the key up once. fPresentLock held. */
++static bool
++d2s_dirty_ready(uint32_t ph, uint32_t n)
++{
++	if (d2s_fb_dirty == 0 || !sweet_console_muted || ph > D2S_SUM_ROWS ||
++	    2 * ((n + 3) / 4) > D2S_NH_KEYS) {
++		return false;
++	}
++	if (!d2s_nh_ready) {
++		/* splitmix64 seeded from the clock: any key not derived from the pixels will do */
++		uint64_t x = mach_absolute_time() ^ 0x6a09e667f3bcc908ULL;
++		for (uint32_t i = 0; i < D2S_NH_KEYS; i++) {
++			x += 0x9e3779b97f4a7c15ULL;
++			uint64_t z = x;
++			z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++			z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++			d2s_nh_key[i] = z ^ (z >> 31);
++		}
++		d2s_nh_ready = true;
++	}
++	if (n != d2s_sums_width) {
++		d2s_sums_width = n;
++		d2s_sums_valid = false;
++	}
++	size_t need = (size_t)ph * n * 4;
++	if (d2s_fb_dirty == 2 && d2s_check_size != need && !d2s_check_failed) {
++		if (d2s_check != NULL) {
++			IOFreeData(d2s_check, d2s_check_size);
++		}
++		d2s_check = (uint8_t *)IOMallocData(need);
++		d2s_check_size = d2s_check != NULL ? need : 0;
++		d2s_check_failed = d2s_check == NULL;
++		d2s_sums_valid = false;
++		IOLog("SWEET FB: dirty rows checked against a %u KiB copy%s\n", (uint32_t)(need >> 10),
++		    d2s_check != NULL ? "" : ": no memory, not checked");
++	}
++	return true;
++}
++
++/* True when panel row py already shows source row srow (n pixels): nothing to copy. */
++static bool
++d2s_row_same(uint64_t py, const uint32_t *srow, uint32_t n)
++{
++	struct d2s_row_sum sum;
++	d2s_row_nh(srow, n, &sum);
++	struct d2s_row_sum *old = &d2s_sums[py];
++	bool same = d2s_sums_valid && sum.lo == old->lo && sum.hi == old->hi;
++	*old = sum;
++	if (d2s_check != NULL) {
++		uint8_t *copy = d2s_check + py * n * 4;
++		if (same && memcmp(copy, srow, (size_t)n * 4) != 0) {
++			d2s_st.misses++;
++			same = false;
++		}
++		if (!same) {
++			memcpy(copy, srow, (size_t)n * 4);
++		}
++	}
++	return same;
++}
++
+ static void
+ d2s_present_scaled(uintptr_t panel, uint32_t rowBytes, uint32_t pw, uint32_t ph,
+     uint32_t lw, uint32_t lh, const uint8_t *src, uint32_t sbpr,
+@@ -465,17 +798,25 @@ d2s_present_scaled(uintptr_t panel, uint32_t rowBytes, uint32_t pw, uint32_t ph,
+ 	if (d2s_fb_scale == 1 && dx == 0 && dy == 0 && (uint32_t)w == lw && (uint32_t)h == lh &&
+ 	    d2s_build_runs(pw, lw, ((uint64_t)1 << 32) / kx)) {
+ 		uint64_t iy = ((uint64_t)1 << 32) / ky;
++		bool dirty = d2s_dirty_ready(ph, (uint32_t)w);
+ 		for (uint64_t py = 0; py < ph; py++) {
+ 			int64_t ly = (int64_t)(((py << 16) + (1 << 15)) * iy >> 32);
+ 			ly = ly >= h ? h - 1 : ly;
+ 			const uint32_t *srow = (const uint32_t *)(src + (uint64_t)(sy + ly) * sbpr) + sx;
+ 			uint32_t *drow = (uint32_t *)(panel + py * rowBytes);
++			if (dirty && d2s_row_same(py, srow, (uint32_t)w)) {
++				continue;               /* 0141: the panel row already shows it */
++			}
+ 			for (uint32_t r = 0; r < d2s_nruns; r++) {
+ 				memcpy(drow + d2s_runs[r].dst, srow + d2s_runs[r].src, (size_t)d2s_runs[r].len * 4);
+ 			}
++			d2s_rows++;
+ 		}
++		d2s_sums_valid = dirty;
+ 		return;
+ 	}
++	d2s_sums_valid = false;                 /* 0141: written below without row sums */
++	d2s_full = true;
+ 	/* rounded edges: the last logical column must reach the panel edge */
+ 	uint64_t px0 = ox + (((uint64_t)dx * kx + 0x8000) >> 16);
+ 	uint64_t px1 = ox + (((uint64_t)(dx + w) * kx + 0x8000) >> 16);
+@@ -506,6 +847,121 @@ d2s_present_scaled(uintptr_t panel, uint32_t rowBytes, uint32_t pw, uint32_t ph,
+ 		}
+ 	}
+ }
++
++/*
++ * 0141 d2sfb_log. Bit 0: every 10 s of presents one line with swaps, presents (and how many
++ * changed no row), rows copied per present, copy and DECON-wait time (avg/max), DECON polls,
++ * wait timeouts, races (d2sfb_mask=1: DECON busy right after the masked copy) and misses
++ * (d2sfb_dirty=2). Bit 1: for a finger-down (SweetHIDTouch::touch), the time to the end of
++ * the first present that started after it and to the first one that changed panel rows
++ * (with d2sfb_dirty=0 every present changes all rows), printed once per touch. A down that
++ * came while another was followed is dropped.
++ */
++extern "C" uint64_t sweet_touch_down_time;     /* SweetHID.cpp */
++static uint64_t d2s_touch_down, d2s_touch_first, d2s_touch_prev;
++static uint32_t d2s_touch_presents;
++
++struct d2s_report {
++	bool stats, touch, touchChanged;
++	uint32_t presents, unchanged, rows, polls, timeouts, races, misses, touchPresents;
++	uint64_t swaps, waitAvg, waitMax, copyAvg, copyMax, touchFirst, touchLast;
++};
++
++static uint64_t
++d2s_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++static void
++d2s_touch_track(uint64_t t0, uint64_t t2, bool changed, struct d2s_report *r)
++{
++	if (d2s_touch_down == 0) {
++		uint64_t t = __atomic_exchange_n(&sweet_touch_down_time, (uint64_t)0, __ATOMIC_RELAXED);
++		if (t == 0 || t < d2s_touch_prev) {
++			d2s_touch_prev = t0;    /* none, or a present after it was not watched */
++			return;
++		}
++		d2s_touch_down = t;
++		d2s_touch_first = 0;
++		d2s_touch_presents = 0;
++	}
++	d2s_touch_prev = t0;
++	if (d2s_touch_down > t0) {
++		return;                 /* came during this present: the next one is the first */
++	}
++	d2s_touch_presents++;
++	if (d2s_touch_first == 0) {
++		d2s_touch_first = t2;
++	}
++	if (changed || d2s_us(t2 - d2s_touch_down) >= 3000000) {
++		r->touch = true;
++		r->touchChanged = changed;
++		r->touchFirst = d2s_us(d2s_touch_first - d2s_touch_down) / 1000;
++		r->touchLast = d2s_us(t2 - d2s_touch_down) / 1000;
++		r->touchPresents = d2s_touch_presents;
++		d2s_touch_down = 0;
++	}
++}
++
++/* After a present, fPresentLock held: t0 start, t1 after the DECON wait, t2 after the copy. */
++static void
++d2s_present_done(uint64_t t0, uint64_t t1, uint64_t t2, struct d2s_report *r)
++{
++	bool changed = d2s_rows != 0 || d2s_full;
++	uint64_t wait = t1 - t0, copy = t2 - t1;
++
++	bzero(r, sizeof(*r));
++	if (d2s_st.start == 0) {
++		d2s_st.start = t0;
++		d2s_st.swaps = sweet_fb_swap_count;
++	}
++	d2s_st.presents++;
++	d2s_st.unchanged += changed ? 0 : 1;
++	d2s_st.rows += d2s_rows;
++	d2s_st.waitSum += wait;
++	d2s_st.waitMax = wait > d2s_st.waitMax ? wait : d2s_st.waitMax;
++	d2s_st.copySum += copy;
++	d2s_st.copyMax = copy > d2s_st.copyMax ? copy : d2s_st.copyMax;
++	if ((d2s_fb_log & 1) && d2s_us(t2 - d2s_st.start) >= 10000000) {
++		r->stats = true;
++		r->swaps = sweet_fb_swap_count - d2s_st.swaps;
++		r->presents = d2s_st.presents;
++		r->unchanged = d2s_st.unchanged;
++		r->rows = d2s_st.rows / d2s_st.presents;
++		r->waitAvg = d2s_us(d2s_st.waitSum / d2s_st.presents);
++		r->waitMax = d2s_us(d2s_st.waitMax);
++		r->copyAvg = d2s_us(d2s_st.copySum / d2s_st.presents);
++		r->copyMax = d2s_us(d2s_st.copyMax);
++		r->polls = d2s_st.polls;
++		r->timeouts = d2s_st.timeouts;
++		r->races = d2s_st.races;
++		r->misses = d2s_st.misses;
++		bzero(&d2s_st, sizeof(d2s_st));
++	}
++	if (d2s_fb_log & 2) {
++		d2s_touch_track(t0, t2, changed, r);
++	}
++}
++
++/* Outside the lock. */
++static void
++d2s_report_print(const struct d2s_report *r)
++{
++	if (r->stats) {
++		IOLog("SWEET FB: 10 s: %llu swaps, %u presents (%u unchanged), %u rows/present, "
++		    "copy %llu/%llu us, wait %llu/%llu us (avg/max), %u polls, %u timeouts, %u races, %u misses\n",
++		    r->swaps, r->presents, r->unchanged, r->rows, r->copyAvg, r->copyMax, r->waitAvg,
++		    r->waitMax, r->polls, r->timeouts, r->races, r->misses);
++	}
++	if (r->touch) {
++		IOLog("SWEET FB: touch down -> first present %llu ms, %s %llu ms (%u presents)\n",
++		    r->touchFirst, r->touchChanged ? "first changed rows" : "no change by", r->touchLast,
++		    r->touchPresents);
++	}
++}
+ #endif
+ 
+ void
+@@ -513,7 +969,13 @@ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 	IOLockLock(fPresentLock);
+-#if defined(DREAMLTE)
++#if defined(D2S)
++	uint64_t t0 = mach_absolute_time();
++	d2s_decon_begin();
++	uint64_t t1 = mach_absolute_time();
++	d2s_rows = 0;
++	d2s_full = false;
++#elif defined(DREAMLTE)
+ 	sweet_fb_wait_frame_done();
+ #endif
+ 
+@@ -552,6 +1014,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 			    get32(a, 12), dx, dy, w, h);
+ 		}
+ 		if (s == NULL || s == fSurface) {
++#if defined(D2S)
++			if (s != NULL) {
++				d2s_sums_valid = false;         /* drawn into the panel memory itself */
++				d2s_full = true;
++			}
++#endif
+ 			OSSafeReleaseNULL(s);
+ 			continue;
+ 		}
+@@ -625,6 +1093,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++#if defined(D2S)
++			d2s_sums_valid = false;         /* 1:1 copy, no row sums */
++			d2s_full = true;
++#endif
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -633,7 +1105,16 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++#if defined(D2S)
++	uint64_t t2 = mach_absolute_time();
++	d2s_decon_end();
++	struct d2s_report report;
++	d2s_present_done(t0, t1, t2, &report);
++	IOLockUnlock(fPresentLock);
++	d2s_report_print(&report);
++#else
+ 	IOLockUnlock(fPresentLock);
++#endif
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index b1094e9..269992c 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -31,6 +31,15 @@
+ 
+ extern "C" uint64_t mach_absolute_time(void);
+ 
++/*
++ * mach_absolute_time() of a finger-down the display has not reported yet: set by the
++ * first down while it is 0, taken (and zeroed) by AppleCLCD::present() for its
++ * touch-to-present log (SweetFramebuffer.cpp, 0141 d2sfb_log bit 1).
++ */
++extern "C" {
++uint64_t sweet_touch_down_time;
++}
++
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+ 	OSDeclareDefaultStructors(IOHIDEventServiceClient);
+@@ -484,6 +493,9 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+ 		    y < SWEET_TOUCH_EDGE_PX || y > fLogicalH - 1 - SWEET_TOUCH_EDGE_PX;
++		uint64_t none = 0;
++		__atomic_compare_exchange_n(&sweet_touch_down_time, &none, now, false,
++		    __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

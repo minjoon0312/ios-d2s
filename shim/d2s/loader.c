@@ -207,8 +207,13 @@ static void copy(uintptr_t dst, uintptr_t src, uint64_t n)
 
 static void zero(uintptr_t dst, uint64_t n)
 {
-	for (; n && (dst & 7); n--, dst++)
+	for (; n && (dst & 15); n--, dst++)
 		*(volatile uint8_t *)dst = 0;
+	/* d1x: 64 bytes per iteration as paired stores (MMU off = Device memory,
+	 * so every store is its own bus write; this halves them for 2 GiB). */
+	for (; n >= 64; n -= 64, dst += 64)
+		__asm__ volatile("stp xzr, xzr, [%0]\n\tstp xzr, xzr, [%0, #16]\n\t"
+		    "stp xzr, xzr, [%0, #32]\n\tstp xzr, xzr, [%0, #48]" : : "r"(dst) : "memory");
 	for (; n >= 8; n -= 8, dst += 8)
 		*(volatile uint64_t *)dst = 0;
 	for (; n; n--, dst++)

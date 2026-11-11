@@ -94,7 +94,7 @@ print(f"  Hedef HFSX bağlandı: {root_mnt} (owners aktif)")
 
 print("=== 3. OS Dosyaları Kopyalanıyor (rsync) ===")
 # Exclude non-essential heavy assets outside launchd -> SpringBoard path
-omit = [
+omit = [] if os.environ.get('IOS_FULL') == '1' else [
     '--exclude=/Applications/***',
     '--exclude=/System/Library/LinguisticData/***',
     '--exclude=/System/Library/PreinstalledAssetsV2/***',

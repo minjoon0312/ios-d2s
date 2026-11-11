@@ -8,7 +8,7 @@ import adt
 import mkadt
 
 DRAM_BASE = 0x900000000
-DRAM_SIZE = 0x20000000  # 512 MiB initial bring-up bank (clean high DRAM above 0x880000000 sec_rdx_bootdev)
+DRAM_SIZE = 0x80000000  # d1x: 2 GiB = the whole 0x900000000 bank (was 512 MiB; iOS ran with 512 MB)
 FB_PHYS, FB_W, FB_H = 0xca000000, 1080, 2280  # d1x (Note 10 5G)
 TIMEBASE = 26000000
 
