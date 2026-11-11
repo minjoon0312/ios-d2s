@@ -4,19 +4,23 @@
     python3 tools/d2s_adt_add_cpus.py d2s.adt d2s_smp.adt
 
 XNU numbers CPUs in ADT order and cpus=N keeps the first N, so the order
-here decides which cores a given cpus= starts:
+here decides which cores a given cpus= starts. DT order, so the XNU logical
+number is the Linux one:
 
     cpu0  A55 0x000  (boot core, already in the ADT)
-    cpu1  M4  0x100  \\ started by plain PSCI CPU_ON in the loader probe
-    cpu2  M4  0x101  /
-    cpu3  A55 0x001  \\
-    cpu4  A55 0x002   | powered by CPU_ON in the loader probe but never ran
-    cpu5  A55 0x003   | the entry there (caches off); untested in the kernel
-    cpu6  A75 0x004   |
-    cpu7  A75 0x005  /
+    cpu1  A55 0x001  \\
+    cpu2  A55 0x002   | cpus=4: the A55 cluster only
+    cpu3  A55 0x003  /
+    cpu4  A75 0x004  \\ cpus=6: + the A75s (same DSU)
+    cpu5  A75 0x005  /
+    cpu6  M4  0x100  \\ cpus=8: + the Mongoose M4 cluster
+    cpu7  M4  0x101  /
 
-cpus=3 starts the boot core and both M4s; cpus=8 tries all of them. Needs
-the kernel with xnu/patches/0126-d2s-smp-psci.patch.
+reg stays the DT reg, the PSCI CPU_ON target. The A55/A75 read MPIDR_EL1
+0x81000n00, not n, so cpus>1 needs the kernel with 0140-d1x-smp-cpuid
+(reset_vector finds a core's cpu data by this reg, passed by the low
+trampoline). Without 0140, A55 #1 (MPIDR low bits 0x100) takes M4 #0's cpu
+data and A55 #2..A75 #5 hang.
 """
 import sys
 from pathlib import Path
@@ -27,7 +31,7 @@ import mkadt   # noqa: E402
 import mkadt_d2s  # noqa: E402
 
 # (MPIDR, mkadt_d2s.cpu_node logical index that describes that core)
-ORDER = [(0x100, 6), (0x101, 7), (0x001, 1), (0x002, 2), (0x003, 3), (0x004, 4), (0x005, 5)]
+ORDER = [(0x001, 1), (0x002, 2), (0x003, 3), (0x004, 4), (0x005, 5), (0x100, 6), (0x101, 7)]
 
 
 def main():

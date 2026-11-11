@@ -1,0 +1,378 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index e9547f9..c3a87c4 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -50,6 +50,68 @@ sweet_psci_cpu_on(uint64_t target, uint64_t entry, uint64_t context)
+ 	return (int32_t)x0;
+ }
+ 
++#if defined(D2S)
++/*
++ * Low CPU_ON trampoline, one D2S_TRAMP_SLOT slot per logical CPU in the
++ * page at 0x8f000000 (mapped uncached by startCPU; EL3 keeps the CPU_ON
++ * entry in a 32-bit register). The slot runs with the MMU off:
++ *   +0x00 adr  x25, #0x40            x25 = slot data
++ *   +0x04 mrs  x2, MPIDR_EL1
++ *   +0x08 str  x2, [x25, #0x10]      +0x50: MPIDR as this core reads it
++ *   +0x0c ldp  x26, x1, [x25]        x26 = ADT reg (cpu_phys_id), x1 = entry
++ *   +0x10 mov  x0, x26
++ *   +0x14 movz x27, #magic[15:0]
++ *   +0x18 movk x27, #magic[31:16], lsl #16
++ *   +0x1c dsb  sy
++ *   +0x20 br   x1                    sweet_secondary_entry
++ *   +0x40 ADT reg, +0x48 entry, +0x50 MPIDR (core), +0x58 cpu data PA that
++ *   reset_vector took, ~0 if it found none (core)
++ * reset_vector matches cpu_phys_id against x26 when x27 holds the magic,
++ * since the DynamIQ A55/A75 read MPIDR 0x81000n00 instead of their reg n.
++ */
++static vm_offset_t d2s_tramp;
++
++static volatile uint64_t *
++d2s_tramp_slot(unsigned int logical)
++{
++	return (volatile uint64_t *)(d2s_tramp + (vm_offset_t)logical * D2S_TRAMP_SLOT);
++}
++
++static void
++d2s_tramp_fill(unsigned int logical, uint32_t phys_id, vm_offset_t entry)
++{
++	static const uint32_t code[] = {
++		0x10000219,                                             /* adr  x25, #0x40 */
++		0xd53800a2,                                             /* mrs  x2, MPIDR_EL1 */
++		0xf9000b22,                                             /* str  x2, [x25, #0x10] */
++		0xa940073a,                                             /* ldp  x26, x1, [x25] */
++		0xaa1a03e0,                                             /* mov  x0, x26 */
++		0xd2800000U | ((D2S_TRAMP_MAGIC & 0xffffU) << 5) | 27,  /* movz x27 */
++		0xf2a00000U | ((D2S_TRAMP_MAGIC >> 16) << 5) | 27,      /* movk x27, lsl #16 */
++		0xd5033f9f,                                             /* dsb  sy */
++		0xd61f0020,                                             /* br   x1 */
++	};
++	volatile uint64_t *s = d2s_tramp_slot(logical);
++	volatile uint32_t *t = (volatile uint32_t *)s;
++
++	/* Drop any line another (cacheable) alias left for the slot, then
++	 * write it through the uncached mapping: a later write-back of a dirty
++	 * line cannot overwrite it, and the core reads it from DRAM. */
++	for (unsigned int off = 0; off < D2S_TRAMP_SLOT; off += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r"((vm_offset_t)s + off) : "memory");
++	}
++	__builtin_arm_dsb(DSB_SY);
++	for (unsigned int i = 0; i < 0x40 / 4; i++) {
++		t[i] = i < sizeof(code) / sizeof(code[0]) ? code[i] : 0xd503201f; /* nop */
++	}
++	s[8] = phys_id;                 /* +0x40 */
++	s[9] = entry;                   /* +0x48 */
++	s[10] = 0;                      /* +0x50 */
++	s[11] = 0;                      /* +0x58 */
++	__builtin_arm_dsb(DSB_SY);
++}
++#endif /* D2S */
++
+ class SweetCPU : public IOCPU {
+ 	OSDeclareDefaultStructors(SweetCPU);
+ 	const OSSymbol *cpuName = NULL;
+@@ -89,10 +151,11 @@ SweetCPU::start(IOService *provider)
+ 	 * logical 4..7 = MPIDR 0x100..0x103. */
+ #if defined(D2S)
+ 	/*
+-	 * Exynos 9825 cores: A55 MPIDR 0..3, A75 4..5, M4 0x100..0x101. XNU
+-	 * numbers CPUs in ADT order and the ADT lists the boot A55 first, then
+-	 * the M4s (started by PSCI alone in the loader probe), then the rest,
+-	 * so cpus=N picks a prefix. Accept any of them in any slot.
++	 * Exynos 9825 cores: ADT reg (= DT reg = PSCI CPU_ON target) A55 0..3,
++	 * A75 4..5, M4 0x100..0x101; MPIDR_EL1 differs on the A55/A75 (0140).
++	 * XNU numbers CPUs in ADT order and cpus=N picks a prefix, so the ADT
++	 * order decides which cores start (0140: A55, A75, M4). Accept any of
++	 * them in any slot.
+ 	 */
+ 	uint32_t expected_mpidr = cpu->phys_id;
+ 	if (cpu->cpu_id == 0 || !(cpu->phys_id <= 5 || cpu->phys_id == 0x100 ||
+@@ -207,12 +270,33 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ 			if (mach_absolute_time() > deadline) {
+ 				IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x NOT alive after 10s\n",
+ 				    i, topology->cpus[i].phys_id);
++#if defined(D2S)
++				if (i != 0 && d2s_tramp != 0) {
++					/* Slot breadcrumbs: tramp mpidr 0 = the core never ran
++					 * the trampoline; rv 0 = it did not reach the cpu data
++					 * match, ~0 = no cpu data has its ADT reg (or bad reset
++					 * handler), else the cpu data PA it took; that and no
++					 * initCPU = died between start_cpu and arm_init_cpu. */
++					volatile uint64_t *s = d2s_tramp_slot(i);
++					uint64_t seen = s[10], rv = s[11];
++					IOLog(CPU_PORT_NAME " CPU: cpu=%u trampoline mpidr=0x%llx reset_vector=0x%llx\n",
++					    i, seen, rv);
++					panic(CPU_PORT_NAME " CPU: cpu=%u startup timeout (tramp mpidr=0x%llx rv=0x%llx)",
++					    i, seen, rv);
++				}
++#endif
+ 				panic(CPU_PORT_NAME " CPU: cpu=%u startup timeout (reset/MMU/GIC/SGI)", i);
+ 			}
+ 			IOSleep(1);
+ 		}
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
+ 		    i, topology->cpus[i].phys_id);
++#if defined(D2S)
++		if (i != 0 && d2s_tramp != 0) {
++			IOLog(CPU_PORT_NAME " CPU: cpu=%u ADT reg 0x%x reads MPIDR_EL1 0x%llx\n",
++			    i, topology->cpus[i].phys_id, d2s_tramp_slot(i)[10]);
++		}
++#endif
+ 	}
+ 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
+ 	ml_cpu_init_completed();
+@@ -259,8 +343,10 @@ SweetCPU::initCPU(bool boot)
+ 		ml_set_interrupts_enabled(old_irq);
+ 	}
+ #endif
+-	kprintf(CPU_PORT_NAME " CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
+-	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
++	/* Full MPIDR_EL1: on the 9825 DynamIQ cores it is not the ADT reg. */
++	kprintf(CPU_PORT_NAME " CPU: cpu=%u entered initCPU mpidr=0x%llx reg=0x%x EL%llu IRQs=%u\n",
++	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1"),
++	    ml_get_topology_info()->cpus[getCPUNumber()].phys_id,
+ 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+ 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
+ }
+@@ -306,6 +392,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		panic(CPU_PORT_NAME " CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
+ 	vm_offset_t entry = ml_static_vtop((vm_offset_t)&sweet_secondary_entry);
++	uint64_t context = getCPUNumber();
+ 	IOLog(CPU_PORT_NAME " CPU: cpu=%u CPU_ON target=0x%x entry_pa=0x%llx context=%u\n",
+ 	    getCPUNumber(), cpu->phys_id, (uint64_t)entry, getCPUNumber());
+ #if defined(DREAMLTE)
+@@ -321,6 +408,21 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		if (tramp == 0) {
+ 			tramp = ml_io_map(tramp_pa, 0x1000);
+ 		}
++#if defined(D2S)
++		/*
++		 * Exynos 9825: a slot per logical CPU that also hands the core its
++		 * ADT reg (x26/x0, magic in x27) for reset_vector, and records the
++		 * MPIDR it reads (d2s_tramp_fill). Cores start one at a time, but a
++		 * slot each means a late core can never run another core's slot.
++		 */
++		d2s_tramp = tramp;
++		d2s_tramp_fill(getCPUNumber(), cpu->phys_id, entry);
++		const uint64_t slot_pa = tramp_pa + (uint64_t)getCPUNumber() * D2S_TRAMP_SLOT;
++		context = cpu->phys_id;
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx, x0=x26=ADT reg 0x%x\n",
++		    getCPUNumber(), (uint64_t)entry, slot_pa, cpu->phys_id);
++		entry = (vm_offset_t)slot_pa;
++#else
+ 		volatile uint32_t *t = (volatile uint32_t *)tramp;
+ 		t[0] = 0x58000041;              /* ldr x1, #8 */
+ 		t[1] = 0xd61f0020;              /* br x1 */
+@@ -330,6 +432,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx\n",
+ 		    getCPUNumber(), (uint64_t)entry, tramp_pa);
+ 		entry = (vm_offset_t)tramp_pa;
++#endif /* D2S */
+ #if defined(D2S)
+ 		/*
+ 		 * Exynos 9825: the EL3 firmware powers the core itself (Samsung's
+@@ -346,8 +449,10 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		uint32_t off = (m & 0x100) ? 0x500 + (m & 1) * 0x80 :
+ 		    (m < 4 ? m * 0x80 : 0x300 + (m - 4) * 0x80);
+ 		volatile uint32_t *cfg = (volatile uint32_t *)(pmu + 0x1000 + off);
+-		IOLog(CPU_PORT_NAME " CPU: cpu=%u d2s PMU cfg=0x%x status=0x%x before CPU_ON\n",
+-		    getCPUNumber(), cfg[0], cfg[1]);
++		/* +0x44: CLUSTERx_CPUy_INT_EN; Linux's cpupm "on" clears bit 3 (WFI
++		 * power-down request). Read only. */
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u d2s PMU cfg=0x%x status=0x%x int_en=0x%x before CPU_ON\n",
++		    getCPUNumber(), cfg[0], cfg[1], cfg[0x44 / 4]);
+ 	}
+ #else
+ 		static vm_offset_t pmu;
+@@ -379,7 +484,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ #endif /* D2S */
+ #endif
+ 	__builtin_arm_dsb(DSB_SY);
+-	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());
++	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, context);
+ 	IOLog(CPU_PORT_NAME " CPU: cpu=%u PSCI CPU_ON rc=%d\n", getCPUNumber(), rc);
+ 	/* cpu_start() discards PE_cpu_start's return; do not silently carry on. */
+ 	if (rc != 0) {
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 6380312..9ea8a15 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1244,12 +1244,36 @@ ml_get_cluster_number(uint32_t phys_id)
+ 	return cpu->cluster_id;
+ }
+ 
++#if defined(D2S)
++/*
++ * Exynos 9825: the DynamIQ A55/A75 read MPIDR_EL1 0x81000n00 while their ADT
++ * reg (cpu phys_id) is n, so an MPIDR lookup returns -1 for A55 #2..A75 #5
++ * and M4 #0's number for A55 #1 (low bits 0x100). reset_vector picked this
++ * core's cpu data by its ADT reg (0140); once TPIDR_EL1 holds a thread (set
++ * by arm_init / arm_init_cpu before cpu_init() and PE_init_cpu(), which are
++ * the callers) use that cpu data. Before that, only the boot CPU runs, and
++ * its MPIDR low bits are 0 in either numbering.
++ */
++static cpu_data_t *
++d2s_local_cpu_data(void)
++{
++	thread_t thread = current_thread();
++	return thread != THREAD_NULL ? thread->machine.CpuDatap : NULL;
++}
++#endif /* D2S */
++
+ unsigned int
+ ml_get_cpu_number_local(void)
+ {
+ 	uint64_t mpidr_el1_value = 0;
+ 	unsigned cpu_id;
+ 
++#if defined(D2S)
++	cpu_data_t *cdp = d2s_local_cpu_data();
++	if (cdp != NULL) {
++		return (unsigned int)cdp->cpu_number;
++	}
++#endif
+ 	/* We identify the CPU based on the constant bits of MPIDR_EL1. */
+ 	MRS(mpidr_el1_value, "MPIDR_EL1");
+ 	cpu_id = ml_get_cpu_number((uint32_t)mpidr_el1_value);
+@@ -1265,6 +1289,12 @@ ml_get_cluster_number_local()
+ 	uint64_t mpidr_el1_value = 0;
+ 	unsigned cluster_id;
+ 
++#if defined(D2S)
++	cpu_data_t *cdp = d2s_local_cpu_data();
++	if (cdp != NULL) {
++		return (int)cdp->cpu_cluster_id;
++	}
++#endif
+ 	/* We identify the cluster based on the constant bits of MPIDR_EL1. */
+ 	MRS(mpidr_el1_value, "MPIDR_EL1");
+ 	cluster_id = ml_get_cluster_number((uint32_t)mpidr_el1_value);
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index ae79267..2c6e400 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -147,6 +147,22 @@ LEXT(reset_vector)
+ 	and		x0, x15, #0xFFFF					// Full Aff1:Aff0 (SWEET: core in Aff1)
+ #else
+ 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
++#endif
++#if defined(D2S)
++	/*
++	 * Exynos 9825: the DynamIQ A55/A75 read MPIDR_EL1 0x81000n00, not their
++	 * ADT reg n (= cpu_phys_id, the PSCI CPU_ON target). Matched on MPIDR,
++	 * A55 #2..A75 #5 find nothing and A55 #1 (low bits 0x100) takes M4 #0's
++	 * cpu data. The low trampoline (SweetCPU::startCPU) enters with x27 =
++	 * D2S_TRAMP_MAGIC, x26 = the ADT reg, x25 = its slot data: then match
++	 * on x26 only, so a miss hangs below instead of borrowing another
++	 * core's cpu data. Without the magic, keep the MPIDR match.
++	 */
++	MOV32	x2, D2S_TRAMP_MAGIC
++	cmp		x27, x2
++	b.ne	Ld2s_match_mpidr
++	mov		w0, w26
++Ld2s_match_mpidr:
+ #endif
+ 	ldr		x1, [x19, CPU_DATA_ENTRIES]			// Load start of data entries
+ 	add		x3, x1, MAX_CPUS * 16				// end addr of data entries = start + (16 * MAX_CPUS)
+@@ -162,6 +178,14 @@ Lnext_cpu_data_entry:
+ 	b.eq	Lskip_cpu_reset_handler				// Not found
+ 	b		Lcheck_cpu_data_entry	// loop
+ Lfound_cpu_data_entry:
++#if defined(D2S)
++	MOV32	x2, D2S_TRAMP_MAGIC
++	cmp		x27, x2
++	b.ne	Ld2s_found_by_mpidr
++	str		x21, [x25, #0x18]				// slot +0x58: the cpu data PA it took (MMU off)
++	dsb		sy
++Ld2s_found_by_mpidr:
++#endif
+ 	adrp	x20, EXT(const_boot_args)@page
+ 	add		x20, x20, EXT(const_boot_args)@pageoff
+ 	ldr		x0, [x21, CPU_RESET_HANDLER]		// Call CPU reset handler
+@@ -193,6 +217,15 @@ Lfound_cpu_data_entry:
+ 
+ 	blr		x0
+ Lskip_cpu_reset_handler:
++#if defined(D2S)
++	MOV32	x2, D2S_TRAMP_MAGIC
++	cmp		x27, x2
++	b.ne	Ld2s_hang
++	movn	x2, #0
++	str		x2, [x25, #0x18]				// slot +0x58 = ~0: no cpu data for x26, or bad handler
++	dsb		sy
++Ld2s_hang:
++#endif
+ 	b		.									// Hang if the handler is NULL or returns
+ 
+ 	.align 3
+@@ -326,7 +359,8 @@ LEXT(sweet_secondary_entry)
+ Lsweet_secondary_bad_el:
+ 	b		.
+ Lsweet_secondary_el1:
+-	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
++	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR
++	 * (D2S: by the ADT reg the low trampoline left in x26, x25-x27 kept). */
+ 	msr		SPSel, #1
+ 	b		EXT(LowResetVectorBase)
+ #endif /* SWEET */
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+index 0207f32..0f30390 100644
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -11,6 +11,9 @@
+ #include <machine/machine_routines.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/arm64/board_config.h>
++#if defined(D2S)
++#include <kern/cpu_number.h>
++#endif
+ 
+ 
+ #if HAS_GIC_V3
+@@ -307,11 +310,28 @@ pe_init_fiq(void)
+ 		panic("a5xelte: cannot map GICv2");
+ 	}
+ 	/* Banked ITARGETSR0 reveals this core's actual GIC CPU-interface bit. */
++#if defined(D2S)
++	/* Index by the cpu data reset_vector picked (0140), never by MPIDR:
++	 * the 9825 A55/A75 MPIDRs are not their ADT regs. */
++	unsigned int logical = (unsigned int)cpu_number();
++#else
+ 	unsigned int logical = ml_get_cpu_number_local();
++#endif
+ 	uint8_t mask = a5_gic_read32(a5_gicd_base, 0x800) & 0xff;
+ 	if (logical >= SWEET_SMP_MAX_CPUS || mask == 0 || (mask & (mask - 1)) != 0) {
+ 		panic("a5xelte: invalid GICv2 CPU%u target mask 0x%x", logical, mask);
+ 	}
++#if defined(D2S)
++	/* Two cores on one cpu data, or one interface for two cores, would
++	 * misroute every SGI; stop here instead. */
++	for (unsigned int i = 0; i < SWEET_SMP_MAX_CPUS; i++) {
++		if ((i == logical && a5_gic_cpu_masks[i] != 0 && a5_gic_cpu_masks[i] != mask) ||
++		    (i != logical && a5_gic_cpu_masks[i] == mask)) {
++			panic("a5xelte: GICv2 CPU%u mask 0x%x clashes with CPU%u mask 0x%x",
++			    logical, mask, i, a5_gic_cpu_masks[i]);
++		}
++	}
++#endif
+ 	a5_gic_cpu_masks[logical] = mask;
+ 	/* INTID 27 is the virtual timer PPI; SGI 1 carries CPU signals. */
+ 	a5_gic_write32(a5_gicd_base, 0x080,
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index b875aed..a14e33b 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -86,6 +86,12 @@
+ #undef A5_FB_STRIDE
+ #define A5_FB_STRIDE                  4320
+ #define D2S_PMU_PHYS                  0x15860000  /* pmu_system_controller */
++/* Low CPU_ON trampoline page 0x8f000000 (SweetCPU::startCPU): one slot per
++ * logical CPU. A slot enters sweet_secondary_entry with x26 = the core's ADT
++ * reg (cpu_phys_id), x27 = D2S_TRAMP_MAGIC and x25 = the slot's data area;
++ * reset_vector then finds the cpu data by x26, not by MPIDR_EL1 (0140). */
++#define D2S_TRAMP_SLOT                0x80
++#define D2S_TRAMP_MAGIC               0xd2510140
+ #define D2S_DECON_PHYS                0x19030000  /* DECON_F */
+ #define D2S_SD_PHYS                   0x13d00000  /* dwmmc2 (microSD) */
+ #define D2S_ALIVE_PHYS                0x15850000  /* pinctrl@15850000 (ALIVE) */
