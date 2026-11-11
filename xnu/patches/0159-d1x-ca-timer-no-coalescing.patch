@@ -1,0 +1,63 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b4d913c..67333c0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,6 +39,9 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #if defined(D2S)
++extern "C" boolean_t mach_timer_coalescing_enabled;    /* osfmk/kern/timer_call.c (0159) */
++#endif
++#if defined(D2S)
+ static uint32_t d2s_fb_scale = 1;       /* boot-arg d2sfb_scale, see d2s_present_scaled */
+ static bool d2s_fb_cleared;
+ static void d2s_panel_written(void);    /* 0156: a write outside the presents (defined with the row sums) */
+@@ -241,6 +244,48 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
++#if defined(D2S)
++	{
++		/*
++		 * 0159 (from wardevsa/ios-a5xelte herolte 0323, there after Scion's MiniIOMobileFramebuffer):
++		 * CoreAnimation draws when a timer of its own fires, and with the kernel's timer coalescing
++		 * on, such a timer may fire up to 100 ms late for a thread that is not real-time (herolte
++		 * and the S9 saw frames exactly 100 ms apart). Coalescing off (sweetfb_tcoal=1 keeps it on).
++		 * And IOMFBDisplayRefresh, which this driver never published: told 120 Hz (sweetfb_cahz=N,
++		 * 0 leaves it out) CoreAnimation starts each frame on an 8.3 ms tick and has more of each
++		 * 16.7 ms refresh for its render thread. Intervals in 2^-32 s, MachTime in ticks.
++		 */
++		int keep = 0;
++		PE_parse_boot_argn("sweetfb_tcoal", &keep, sizeof(keep));
++		if (!keep && mach_timer_coalescing_enabled) {
++			mach_timer_coalescing_enabled = FALSE;
++		}
++		uint32_t told = 120;
++		PE_parse_boot_argn("sweetfb_cahz", &told, sizeof(told));
++		OSDictionary *refresh = (told >= 30 && told <= 240) ? OSDictionary::withCapacity(4) : NULL;
++		if (refresh != NULL) {
++			uint64_t interval = (1ULL << 32) / told, ticks = 0;
++			nanoseconds_to_absolutetime(NSEC_PER_SEC / told, &ticks);
++			static const char *const keys[] = { "displayMinRefreshInterval", "displayMaxRefreshInterval", "displayRefreshStep" };
++			for (unsigned k = 0; k < 3; k++) {
++				OSNumber *n = OSNumber::withNumber(interval, 64);
++				if (n != NULL) {
++					refresh->setObject(keys[k], n);
++					n->release();
++				}
++			}
++			OSNumber *t = OSNumber::withNumber(ticks, 64);
++			if (t != NULL) {
++				refresh->setObject("displayRefreshStepMachTime", t);
++				t->release();
++			}
++			setProperty("IOMFBDisplayRefresh", refresh);
++			refresh->release();
++		}
++		IOLog("SWEET FB: 0159 timer coalescing %s; CoreAnimation told %u Hz\n",
++		    mach_timer_coalescing_enabled ? "on" : "off", refresh != NULL ? told : 0);
++	}
++#endif
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
