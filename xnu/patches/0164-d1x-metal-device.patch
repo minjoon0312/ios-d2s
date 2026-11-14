@@ -1,0 +1,392 @@
+diff --git a/bsd/kern/d2s_files.c b/bsd/kern/d2s_files.c
+index ea77db9..d441ece 100644
+--- a/bsd/kern/d2s_files.c
++++ b/bsd/kern/d2s_files.c
+@@ -12,6 +12,10 @@
+  *     u32 size (whole record) | u16 op | u16 0 | u32 mode | u32 uid | u32 gid
+  *     u32 path_len (with NUL) | u32 data_len | u32 0 | path | pad | data
+  *   op 1: write always, op 2: write only if the path does not exist
++ *   For both ops, missing parent directories are created first (0164, like
++ *   mkdir -p: mode 0755, root:wheel), so a record can put a file in a new
++ *   directory, e.g. /System/Library/Extensions/RedwoodMetal.bundle/Info.plist.
++ *   Existing directories are left as they are.
+  *
+  * The root is read-only until launchd's own `mount -uw /`, so a kernel
+  * thread waits for that (up to 120 s), then writes every file: open with
+@@ -23,7 +27,8 @@
+ #include <sys/fcntl.h>
+ #include <sys/mount.h>
+ #include <sys/vnode.h>
+-#include <sys/vnode_internal.h>	/* vnode_setsize, rootvnode */
++#include <sys/vnode_internal.h>	/* vnode_setsize, rootvnode, vn_create */
++#include <sys/namei.h>			/* NDINIT, namei (0164 mkdir) */
+ #include <sys/kauth.h>
+ #include <sys/proc.h>
+ #include <kern/thread.h>
+@@ -55,6 +60,89 @@ static const uint8_t *blob;
+ static uint32_t blob_size;
+ static volatile int files_state;	/* 0 working, 1 done (or nothing to do) */
+ 
++/* one directory, mode 0755, root:wheel (mkdir1at without the syscall parts); EEXIST if there */
++static int
++mkdir_one(const char *path, vfs_context_t ctx)
++{
++	struct nameidata nd;
++	struct vnode_attr va;
++	vnode_t vp = NULLVP;
++	int err;
++
++	NDINIT(&nd, CREATE, OP_MKDIR, LOCKPARENT, UIO_SYSSPACE, CAST_USER_ADDR_T(path), ctx);
++	nd.ni_cnd.cn_flags |= WILLBEDIR;
++	err = namei(&nd);
++	if (err) {
++		return err;
++	}
++	if (nd.ni_vp != NULLVP) {
++		vnode_put(nd.ni_vp);
++		err = EEXIST;
++	} else {
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_type, VDIR);
++		VATTR_SET(&va, va_mode, 0755);
++		VATTR_SET(&va, va_uid, 0);
++		VATTR_SET(&va, va_gid, 0);
++		err = vn_create(nd.ni_dvp, &vp, &nd, &va, 0, 0, NULL, ctx);
++		if (!err && vp != NULLVP) {
++			vnode_put(vp);
++		}
++	}
++	nameidone(&nd);		/* before the parent's put, as mkdir1at */
++	vnode_put(nd.ni_dvp);
++	return err;
++}
++
++/*
++ * mkdir -p of the directory part of path (0164). Only called when opening the
++ * file failed with ENOENT. Components that exist are passed over (a symlink in
++ * the way, such as /var, is followed by the lookup); one that exists and is
++ * not a directory stops it with ENOTDIR.
++ */
++static char mkdir_buf[MAXPATHLEN];	/* only the install thread uses it */
++
++static int
++mkdir_parents(const char *path, vfs_context_t ctx)
++{
++	size_t n = strlcpy(mkdir_buf, path, sizeof(mkdir_buf));
++	int made = 0;
++
++	if (n >= sizeof(mkdir_buf)) {
++		return ENAMETOOLONG;
++	}
++	for (char *c = mkdir_buf + 1; *c; c++) {
++		if (*c != '/') {
++			continue;
++		}
++		*c = '\0';
++		vnode_t dvp = NULLVP;
++		int err = vnode_lookup(mkdir_buf, 0, &dvp, ctx);
++		if (err == 0) {
++			bool dir = vnode_isdir(dvp);
++			vnode_put(dvp);
++			if (!dir) {
++				printf("D2S FILES: %s is in the way and not a directory\n", mkdir_buf);
++				return ENOTDIR;
++			}
++		} else if (err == ENOENT) {
++			err = mkdir_one(mkdir_buf, ctx);
++			if (err && err != EEXIST) {
++				printf("D2S FILES: mkdir %s: error %d\n", mkdir_buf, err);
++				return err;
++			}
++			if (!err) {
++				made++;
++				printf("D2S FILES: %s (directory, mode 755, 0:0): made\n", mkdir_buf);
++			}
++		} else {
++			return err;
++		}
++		*c = '/';
++	}
++	return made ? 0 : ENOENT;	/* nothing was missing: the ENOENT was not ours to fix */
++}
++
+ static int
+ write_one(const char *path, const void *data, uint32_t len, const struct d2s_file_rec *r)
+ {
+@@ -68,6 +156,10 @@ write_one(const char *path, const void *data, uint32_t len, const struct d2s_fil
+ 	}
+ 	err = vnode_open(path, O_CREAT | FWRITE | O_NOFOLLOW, (int)(r->mode & 07777),
+ 	    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (err == ENOENT && mkdir_parents(path, ctx) == 0) {
++		err = vnode_open(path, O_CREAT | FWRITE | O_NOFOLLOW, (int)(r->mode & 07777),
++		    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	}
+ 	if (err) {
+ 		return err;
+ 	}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 7f0562e..fa37459 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -511,6 +511,23 @@ d2s_exec_env(struct image_params *imgp, int ptr_size)
+ 			}
+ 			return EPERM;
+ 		}
++		/*
++		 * 0164: with d2smetal>=2 CoreAnimation in backboardd takes the Metal road
++		 * (iokit D2SGPU.cpp). backboardd then waits (up to 10 s) for the boot file
++		 * install, so the Metal bundle and the CoreAnimation preferences of the
++		 * metal-stage2 files are in place before it reads any of them.
++		 */
++		static uint32_t metal_level = UINT32_MAX;
++		if (metal_level == UINT32_MAX) {
++			uint32_t level = 0;
++			(void)PE_parse_boot_argn("d2smetal", &level, sizeof(level));
++			metal_level = level;
++		}
++		if (metal_level >= 2 && strcmp(base, "backboardd") == 0) {
++			bool done = d2s_files_wait(10000);
++			printf("D2S METAL: backboardd starts after the boot file install (%s)\n",
++			    done ? "done" : "still running after 10 s");
++		}
+ 	}
+ 	static char rule[200];
+ 	static size_t n;		/* length of NAME */
+diff --git a/iokit/Kernel/arm/D2SGPU.cpp b/iokit/Kernel/arm/D2SGPU.cpp
+index 9de4deb..3c49e67 100644
+--- a/iokit/Kernel/arm/D2SGPU.cpp
++++ b/iokit/Kernel/arm/D2SGPU.cpp
+@@ -42,7 +42,9 @@
+  * panfrost.
+  *
+  * At boot, a thread runs the buffer and submit paths once from the kernel
+- * and logs "D2S GPU UC: BOOT TEST ...".
++ * and logs "D2S GPU UC: BOOT TEST ...". *
++ * With boot-arg d2smetal it also publishes the Metal device (IOAcceleratorES,
++ * 0164; see "the Metal device" below).
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -438,6 +440,214 @@ D2SGPUSpace::flushBuf(uint32_t handle)
+ 	return ret;
+ }
+ 
++/* ---- the Metal device (0164, boot-arg d2smetal) ----------------------- */
++
++/*
++ * How iOS 16.7.16 finds a GPU for Metal (Metal.framework of the 20H392 shared cache, read
++ * on the Mac): _MTLRegisterDevices (0x181b144c8) runs IOServiceGetMatchingServices(
++ * IOServiceMatching("IOAcceleratorES")) and, for each service, getMetalPluginClassForService
++ * (0x181a3c7c8): IORegistryEntryCreateCFProperty "MetalPluginName" (must be a CFString) ->
++ * +[NSBundle bundleWithPath:] "/System/Library/Extensions/" + name + ".bundle", then
++ * "MetalPluginClassName" -> -[NSBundle classNamed:] (else -principalClass), which must be a
++ * subclass of _MTLDevice. Then [[cls alloc] initWithAcceleratorPort:service] and
++ * MTLAddDevice. Nothing else is read. MTLCreateSystemDefaultDevice() and MTLCopyAllDevices()
++ * both run this once per process.
++ *
++ * So the kernel publishes one IOAcceleratorES service, a child of D2SGPU, whose two names
++ * point at y2sios's driver (ios-d2s/tools/d2s-metal: RedwoodMetal.bundle, class
++ * RedwoodMetalDevice; it reaches the GPU through libredwoodair and D2SGPU, not through this
++ * service, so the service has no user client). As in the S8 port (s8gpu_publish_metal) and
++ * y2sios (MiniIOMobileFramebuffer.cpp, metal=1), with one difference: the two names are not
++ * in the property table. They are answered per process, by name, from copyProperty and
++ * serializeProperties, so a test process can have the device while the window server does
++ * not. On 16.7.16 CoreAnimation takes the Metal road as soon as backboardd's Metal has a
++ * device (S8 boots 47 to 49), so who sees the names IS the switch:
++ *
++ *   d2smetal=0 (default)  nothing published, as before 0164
++ *   d2smetal=1            published; the names are shown only to the processes listed in
++ *                         d2smtlp=NAME,NAME (default "timed", the mtltest host). Everyone else,
++ *                         backboardd included, sees an IOAcceleratorES without them, which
++ *                         Metal passes over: no device, CoreAnimation stays on the CPU.
++ *                         (QuartzCore's CAMetalContextCreate also stops polling for an
++ *                         IOAcceleratorES for 30 s, ios-guacamole 0088.)
++ *   d2smetal=2            as 1, plus backboardd: CoreAnimation draws through RedwoodMetal
++ *   d2smetal=3            every process (apps, SpringBoard, WebKit)
++ *
++ * A process keeps the answer of its first read (Metal registers once per process). Before a
++ * process is shown the names, the boot file install (bsd/kern/d2s_files.c, which writes the
++ * bundle) is waited for, up to 15 s, so NSBundle never opens a half-written bundle. While
++ * the GPU core is not up, nobody is shown the names.
++ */
++extern "C" bool d2s_files_wait(uint32_t ms);
++
++#define D2S_METAL_NAME_KEY	"MetalPluginName"
++#define D2S_METAL_CLASS_KEY	"MetalPluginClassName"
++#define D2S_METAL_BUNDLE	"RedwoodMetal"		/* /System/Library/Extensions/RedwoodMetal.bundle */
++#define D2S_METAL_CLASS		"RedwoodMetalDevice"
++
++static uint32_t d2s_metal_level;
++static char d2s_metal_procs[128] = "timed";
++static volatile uint32_t d2s_metal_said;
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++class D2SMetalAccelerator : public IOAcceleratorES {
++	OSDeclareDefaultStructors(D2SMetalAccelerator);
++
++public:
++	using IOAcceleratorES::copyProperty;
++	OSObject *copyProperty(const char *aKey) const APPLE_KEXT_OVERRIDE;
++	OSObject *copyProperty(const OSString *aKey) const APPLE_KEXT_OVERRIDE;
++	OSObject *copyProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
++	bool serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;
++
++private:
++	OSObject *plugin(const char *aKey, bool *handled) const;
++};
++
++OSDefineMetaClassAndStructors(D2SMetalAccelerator, IOAcceleratorES);
++
++static bool
++d2s_metal_listed(const char *who)
++{
++	size_t n = strlen(who);
++	for (const char *t = d2s_metal_procs; n != 0 && *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == n && strncmp(t, who, n) == 0) {
++			return true;
++		}
++		if (end == NULL) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
++}
++
++/* whether the calling process is shown the two names; its name goes to who */
++static bool
++d2s_metal_shown(char *who, int size)
++{
++	proc_selfname(who, size);
++	if (d2s_metal_level >= 3) {
++		return true;
++	}
++	if (d2s_metal_level >= 2 && strcmp(who, "backboardd") == 0) {
++		return true;
++	}
++	return d2s_metal_listed(who);
++}
++
++/* the answer for one of the two keys (handled = it was one of them), retained; NULL = not shown */
++OSObject *
++D2SMetalAccelerator::plugin(const char *aKey, bool *handled) const
++{
++	bool isName = aKey != NULL && strcmp(aKey, D2S_METAL_NAME_KEY) == 0;
++	char who[32] = "?";
++
++	*handled = isName || (aKey != NULL && strcmp(aKey, D2S_METAL_CLASS_KEY) == 0);
++	if (!*handled) {
++		return NULL;
++	}
++	bool shown = d2s_metal_shown(who, (int)sizeof(who));
++	const char *why = shown ? "shown" : "hidden";
++	if (shown && d2s_gpu_get_info() == NULL) {
++		shown = false;
++		why = "hidden: the GPU is not up";
++	}
++	if (shown && isName && !d2s_files_wait(15000)) {
++		why = "shown, but the boot file install is still running after 15 s";
++	}
++	if (isName && d2s_metal_said < 40) {
++		d2s_metal_said++;
++		IOLog("D2S METAL: %s reads " D2S_METAL_NAME_KEY ": %s (d2smetal=%u)\n", who, why,
++		    d2s_metal_level);
++	}
++	if (!shown) {
++		return NULL;
++	}
++	return OSString::withCString(isName ? D2S_METAL_BUNDLE : D2S_METAL_CLASS);
++}
++
++OSObject *
++D2SMetalAccelerator::copyProperty(const char *aKey) const
++{
++	bool handled;
++	OSObject *obj = plugin(aKey, &handled);
++	return handled ? obj : IOAcceleratorES::copyProperty(aKey);
++}
++
++OSObject *
++D2SMetalAccelerator::copyProperty(const OSString *aKey) const
++{
++	bool handled;
++	OSObject *obj = plugin(aKey ? aKey->getCStringNoCopy() : NULL, &handled);
++	return handled ? obj : IOAcceleratorES::copyProperty(aKey);
++}
++
++OSObject *
++D2SMetalAccelerator::copyProperty(const OSSymbol *aKey) const
++{
++	bool handled;
++	OSObject *obj = plugin(aKey ? aKey->getCStringNoCopy() : NULL, &handled);
++	return handled ? obj : IOAcceleratorES::copyProperty(aKey);
++}
++
++/* IORegistryEntryCreateCFProperties and ioreg -l: the table plus the names, if shown */
++bool
++D2SMetalAccelerator::serializeProperties(OSSerialize *s) const
++{
++	bool handled, ok;
++	OSObject *name = plugin(D2S_METAL_NAME_KEY, &handled);
++	OSObject *cls = name ? plugin(D2S_METAL_CLASS_KEY, &handled) : NULL;
++	if (name == NULL || cls == NULL) {
++		OSSafeReleaseNULL(name);
++		return IOAcceleratorES::serializeProperties(s);
++	}
++	OSDictionary *d = dictionaryWithProperties();
++	ok = d != NULL && d->setObject(D2S_METAL_NAME_KEY, name) &&
++	    d->setObject(D2S_METAL_CLASS_KEY, cls) && d->serialize(s);
++	OSSafeReleaseNULL(d);
++	name->release();
++	cls->release();
++	return ok;
++}
++
++static void
++d2s_metal_publish(IOService *provider)
++{
++	uint32_t level = 0;
++	if (!PE_parse_boot_argn("d2smetal", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	d2s_metal_level = level;
++	(void)PE_parse_boot_argn("d2smtlp", d2s_metal_procs, sizeof(d2s_metal_procs));
++	D2SMetalAccelerator *acc = OSTypeAlloc(D2SMetalAccelerator);
++	if (acc == NULL || !acc->init()) {
++		OSSafeReleaseNULL(acc);
++		IOLog("D2S METAL: d2smetal=%u: no memory for the accelerator\n", level);
++		return;
++	}
++	acc->setName("D2SMetalAccelerator");
++	acc->setProperty("model", "Mali-G76 MP12");
++	acc->setProperty("D2SMetalLevel", (unsigned long long)level, 32);
++	if (!acc->attach(provider)) {
++		acc->release();
++		IOLog("D2S METAL: d2smetal=%u: attach failed\n", level);
++		return;
++	}
++	acc->registerService();
++	IOLog("D2S METAL: d2smetal=%u: IOAcceleratorES published; " D2S_METAL_BUNDLE ".bundle / "
++	    D2S_METAL_CLASS " shown to %s%s\n", level, level >= 3 ? "every process" : d2s_metal_procs,
++	    level == 2 ? " and backboardd" : "");
++	acc->release();
++}
++
+ /* ---- the service ----------------------------------------------------- */
+ 
+ class D2SGPU : public IOService {
+@@ -461,6 +671,7 @@ D2SGPU::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "D2SGPUUserClient");
+ 	registerService();
+ 	IOLog("D2S GPU UC: D2SGPU registered\n");
++	d2s_metal_publish(this);	/* 0164: only with boot-arg d2smetal */
+ 
+ 	int test = 1;
+ 	(void)PE_parse_boot_argn("d2sgpu", &test, sizeof(test));

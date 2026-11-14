@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/d2s_cpufreq.c b/bsd/dev/d2s_cpufreq.c
+index 8c1a578..81ecae0 100644
+--- a/bsd/dev/d2s_cpufreq.c
++++ b/bsd/dev/d2s_cpufreq.c
+@@ -844,6 +844,13 @@ d2s_cpufreq_start(void)
+ 		}
+ 		LOG("0157: little cpus %#llx, big first %u", (unsigned long long)sweet_little_cpus, bigfirst);
+ 	}
++	{
++		extern int sweet_parallelism;           /* osfmk/kern/sched_prim.c (0164) */
++		int par = 0;
++		(void)PE_parse_boot_argn("sweetpar", &par, sizeof(par));
++		sweet_parallelism = par;
++		LOG("0164: dispatch_apply width %d (0 = every core)", par);
++	}
+ 	d2s_cpufreq_boot();
+ 	d2s_thermal_start();    /* 0147: its own thread, after every boot-time ACPM call */
+ }
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index e6035a6..4065ca4 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -8014,6 +8014,18 @@ qos_max_parallelism(int qos, uint64_t options)
+ 	return SCHED(qos_max_parallelism)(qos, options);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * (0164, from syncmodz/ios-s9 0098) libdispatch sizes dispatch_apply by the parallelism the kernel reports for
++ * the caller's QoS. CoreAnimation's CPU renderer (CA::OGL::SW::draw_polygon) splits every polygon into 4-row
++ * chunks with dispatch_apply and waits for the last chunk before the next polygon, so every polygon wakes
++ * helpers on every core (IPIs) and may wait for an A55. N > 0 reports N for QoS legacy/default and above.
++ * S9 (4 A75 + 4 A55): N=2 took Settings scrolling from 23/28 to 31/53 fps (median/max), IPIs 30k -> 12k/s.
++ * Boot-arg sweetpar=N (read in bsd/dev/d2s_cpufreq.c); 0 = stock (every core).
++ */
++int sweet_parallelism;
++#endif
++
+ uint32_t
+ sched_qos_max_parallelism(__unused int qos, uint64_t options)
+ {
+@@ -8027,6 +8039,12 @@ sched_qos_max_parallelism(__unused int qos, uint64_t options)
+ 	 */
+ 	assert((options & QOS_PARALLELISM_CLUSTER_SHARED_RESOURCE) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
++	if (sweet_parallelism > 0 && qos >= THREAD_QOS_LEGACY) {
++		return (uint32_t)sweet_parallelism;
++	}
++#endif
++
+ 	/* Query the machine layer for core information */
+ 	__assert_only kern_return_t kret = host_info(host_self(), HOST_BASIC_INFO,
+ 	    (host_info_t)&hinfo, &count);
