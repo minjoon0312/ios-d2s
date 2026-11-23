@@ -11,9 +11,29 @@
  * turns back into that mapping. Imported IOSurfaces are mapped on first use.
  *
  * Caches: we report panfrost interface 1.5, so Mesa treats mappings as
- * write-combined and does no cache maintenance. Mappings are cached; the
- * kernel writes back the buffers a job lists before it runs (SUBMIT_ASYNC)
- * and drops them from the caches when WAIT_BO is done (BUF_WAIT).
+ * write-combined and does no cache maintenance. Mappings are cached and the
+ * GPU does not snoop, so d2sdrm decides what the kernel cleans (research/
+ * GPU_PLAN_2026-11-23.md, section 2). Policy D2SDRM_FLUSH (env, else boot-arg
+ * d2sflush=), default "lean":
+ *   before a job  SUBMIT_ASYNC writes back exactly the handles it is given:
+ *                 own buffers Mesa has CPU-mapped (descriptors, uniforms,
+ *                 shaders, uploads) and imported IOSurfaces on their first
+ *                 use, when Mesa mapped them, or when IOSurfaceGetSeed moved
+ *                 (a CPU writer's IOSurfaceUnlock; D2SDRM_SEED=0 / d2sseed=0:
+ *                 always). Never the tiler heap (PANFROST_BO_HEAP) or a buffer
+ *                 Mesa never mapped (PAN_BO_INVISIBLE varyings, TLS, GPU-only
+ *                 render targets): the CPU never wrote those after the kernel
+ *                 zeroed and cleaned them at BUF_CREATE.
+ *   after a job   only imported IOSurfaces the GPU may have written (Mesa's
+ *                 access flags, bit 31 of the handle, patch-mesa25.py) are
+ *                 flushed (BUF_FLUSH), once per wait however many finished
+ *                 jobs named them: the kernel's present copies them from a
+ *                 cached mapping. Own buffers are dropped from the caches when
+ *                 Mesa waits for them before a CPU read (WAIT_BO) or maps them.
+ *   "noheap"      every listed handle but the heap, before and after a job
+ *   "all"         every listed handle before and after a job (v14)
+ * The kernel only knows the jobs of handles it was given, so d2sdrm keeps each
+ * buffer's newest job itself: WAIT_BO and GEM_CLOSE wait for it.
  *
  * Fences: a syncobj holds a D2SGPU sequence number. Jobs of all processes
  * run in submission order, so a job's in-syncs are always met by the time
@@ -49,6 +69,13 @@ struct bo {
 	int kind;
 	struct d2sgpu_buf buf;
 	uint32_t create_flags;
+	uint8_t mapped;		/* Mesa asked for the CPU mapping (d2sdrm_mmap) */
+	uint8_t listed;		/* surface: written back before a job at least once */
+	uint32_t seed;		/* surface: IOSurfaceGetSeed when last written back */
+	void *surface;		/* surface: IOSurfaceLookup reference, or NULL */
+	uint64_t last_seq;	/* newest job whose Mesa list named it */
+	uint64_t clean_seq;	/* last_seq when its CPU lines were last dropped */
+	uint64_t post_seq;	/* newest job that may have written it, not flushed yet */
 };
 
 struct syncobj {
@@ -57,18 +84,69 @@ struct syncobj {
 	uint64_t seq;		/* 0: none attached */
 };
 
-/*
- * The buffers of recent jobs. Mesa waits on syncobjs, not on buffers, so
- * nothing else would drop stale CPU cache lines of what a job wrote: the
- * first wait that sees a job finished flushes its buffers (BUF_FLUSH).
- */
-#define NJOBS		64
-#define JOB_BOS		256
+/* IOSurface.framework (libredwoodair and pantest link it); declared here so
+ * this file needs no IOSurface headers. */
+extern void *IOSurfaceLookup(uint32_t csid);
+extern uint32_t IOSurfaceGetSeed(void *surface);
+
+/* Bits Mesa sets in SUBMIT's handles (patch-mesa25.py, pan_jm.c): the access
+ * flags are known, and the GPU may write the buffer. */
+#define H_HINT		0x40000000u
+#define H_WRITE		0x80000000u
+#define H_MASK		0x3fffffffu
+
+enum { FLUSH_ALL, FLUSH_NOHEAP, FLUSH_LEAN };
+static const char *const flush_names[] = { "all", "noheap", "lean" };
+static int flush_mode = -1;	/* FLUSH_* */
+static int seed_skip = -1;	/* 1: surfaces only when their seed moved */
+static uint64_t seen_done;	/* newest job number a WAIT said was finished */
+static uint32_t post_pending;	/* buffers with post_seq set */
+
+/* "d2sflush=lean" style word of the kernel's boot-args into out; 0 if absent */
+static int
+bootarg(const char *name, char *out, size_t size)
+{
+	char args[1024] = "";
+	size_t n = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &n, NULL, 0) != 0) {
+		return 0;
+	}
+	size_t len = strlen(name);
+	for (const char *p = args; (p = strstr(p, name)) != NULL; p += len) {
+		if ((p == args || p[-1] == ' ') && p[len] == '=') {
+			size_t v = strcspn(p + len + 1, " ");
+			snprintf(out, size, "%.*s", (int)v, p + len + 1);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+read_policy(void)
+{
+	char v[16] = "";
+	const char *e = getenv("D2SDRM_FLUSH");
+	if (e == NULL && bootarg("d2sflush", v, sizeof(v))) {
+		e = v;
+	}
+	flush_mode = (e && !strcmp(e, "all")) ? FLUSH_ALL :
+	    (e && !strcmp(e, "noheap")) ? FLUSH_NOHEAP : FLUSH_LEAN;
+	char s[16] = "";
+	e = getenv("D2SDRM_SEED");
+	if (e == NULL && bootarg("d2sseed", s, sizeof(s))) {
+		e = s;
+	}
+	seed_skip = !(e && e[0] == '0');
+}
+
+/* What the cache maintenance cost, reported every 10 s (stats_report). */
 static struct {
-	uint64_t seq;
-	uint32_t n, flushed;
-	uint32_t h[JOB_BOS];
-} jobs[NJOBS];
+	int64_t since;
+	uint32_t jobs, pre, out, seedskip, post, waitbo, boflush, closewait, nolookup, hints;
+	uint64_t pre_b, out_b, seedskip_b, post_b, boflush_b;
+	int64_t submit_ns, post_ns;
+} st;
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static io_connect_t conn = MACH_PORT_NULL;
@@ -132,20 +210,43 @@ now_ns(void)
 	return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
-/* Flush the buffers of every recorded job up to done_seq not flushed yet. */
+/* Write back and drop a buffer's CPU cache lines now (kernel BUF_FLUSH). */
+static void
+buf_flush(uint32_t h)
+{
+	uint64_t a = h;
+	IOConnectCallMethod(conn, 10 /* BUF_FLUSH */, &a, 1, NULL, 0, NULL, NULL, NULL, NULL);
+}
+
+/*
+ * Jobs up to done_seq are finished: drop the CPU lines of every buffer a
+ * finished job may have written that the CPU may read (post_seq), each once
+ * however many of those jobs named it. Mesa waits on syncobjs, not on
+ * buffers, so this is where it happens.
+ */
 static void
 after_done(uint64_t done_seq)
 {
 	pthread_mutex_lock(&lock);
-	for (int i = 0; i < NJOBS; i++) {
-		if (jobs[i].seq != 0 && jobs[i].seq <= done_seq && !jobs[i].flushed) {
-			for (uint32_t k = 0; k < jobs[i].n; k++) {
-				uint64_t h = jobs[i].h[k];
-				IOConnectCallMethod(conn, 10 /* BUF_FLUSH */, &h, 1, NULL, 0, NULL, NULL,
-				    NULL, NULL);
+	if (done_seq > seen_done) {
+		seen_done = done_seq;
+	}
+	if (post_pending != 0) {
+		int64_t t0 = now_ns();
+		for (uint32_t h = 1; h < MAX_HANDLES; h++) {
+			struct bo *b = &bos[h];
+			if (b->kind != BO_FREE && b->post_seq != 0 && b->post_seq <= done_seq) {
+				buf_flush(h);
+				st.post++;
+				st.post_b += b->buf.size;
+				if (b->clean_seq < b->post_seq) {
+					b->clean_seq = b->post_seq;
+				}
+				b->post_seq = 0;
+				post_pending--;
 			}
-			jobs[i].flushed = 1;
 		}
+		st.post_ns += now_ns() - t0;
 	}
 	pthread_mutex_unlock(&lock);
 }
@@ -216,18 +317,38 @@ create_bo(struct drm_panfrost_create_bo *a)
 		d2sgpu_buf_destroy(conn, &b);
 		return fail(ENOMEM);
 	}
-	bos[b.handle] = (struct bo){ BO_OWN, b, a->flags };
+	bos[b.handle] = (struct bo){ .kind = BO_OWN, .buf = b, .create_flags = a->flags };
 	a->handle = b.handle;
 	a->offset = b.gpu_va;
 	return 0;
 }
 
+/* Called with lock held. */
 static int
 close_bo(uint32_t h)
 {
 	struct bo *bo = bo_get(h);
 	if (bo == NULL) {
 		return fail(EINVAL);
+	}
+	/* The kernel's BUF_DESTROY only waits for jobs that listed the buffer to it,
+	 * and lean submits leave most out: wait for its newest job here. */
+	if (bo->last_seq > seen_done) {
+		uint64_t seq = bo->last_seq;
+		st.closewait++;
+		pthread_mutex_unlock(&lock);
+		(void)wait_seq(seq, -1);
+		pthread_mutex_lock(&lock);
+		bo = bo_get(h);
+		if (bo == NULL) {
+			return fail(EINVAL);
+		}
+	}
+	if (bo->post_seq != 0) {
+		post_pending--;
+	}
+	if (bo->surface != NULL) {
+		CFRelease(bo->surface);
 	}
 	d2sgpu_buf_destroy(conn, &bo->buf);	/* unmaps our view too */
 	memset(bo, 0, sizeof(*bo));
@@ -251,6 +372,18 @@ d2sdrm_mmap(int fd, off_t offset, size_t size)
 		}
 		if (bo->buf.cpu != NULL) {
 			p = bo->buf.cpu;
+			if (!bo->mapped) {
+				/* the CPU may read and write it from now on (2.3 rule 3); lines
+				 * it may hold from before the GPU's finished jobs go first */
+				bo->mapped = 1;
+				if (bo->last_seq != 0 && bo->last_seq <= seen_done &&
+				    bo->clean_seq < bo->last_seq) {
+					buf_flush(bo->buf.handle);
+					st.boflush++;
+					st.boflush_b += bo->buf.size;
+					bo->clean_seq = bo->last_seq;
+				}
+			}
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -309,7 +442,12 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 	if (is_dev(fd) && id != 0 &&
 	    d2sgpu_import_surface(conn, id, D2SGPU_BUF_GPU_WRITE, &b) == KERN_SUCCESS &&
 	    b.handle < MAX_HANDLES) {
-		bos[b.handle] = (struct bo){ BO_SURFACE, b, PANFROST_BO_NOEXEC };
+		bos[b.handle] = (struct bo){ .kind = BO_SURFACE, .buf = b, .create_flags = PANFROST_BO_NOEXEC };
+		/* for IOSurfaceGetSeed: a load from the surface's shared state page */
+		bos[b.handle].surface = IOSurfaceLookup(id);
+		if (bos[b.handle].surface == NULL) {
+			st.nolookup++;
+		}
 		*handle = b.handle;
 		ret = 0;
 	}
@@ -416,29 +554,139 @@ sync_get(uint32_t h)
 	return h >= 1 && h < MAX_SYNCOBJS && syncobjs[h].used ? &syncobjs[h] : NULL;
 }
 
+/* Called with lock held: the 10 s cache maintenance report. */
+static void
+stats_report(void)
+{
+	int64_t t = now_ns();
+	if (st.since == 0) {
+		st.since = t;
+		d2sdrm_log(dev_fd, "d2sdrm: cache policy %s, seed skip %s (D2SDRM_FLUSH/D2SDRM_SEED, "
+		    "d2sflush=/d2sseed=)", flush_names[flush_mode], seed_skip ? "on" : "off");
+		return;
+	}
+	if (t - st.since < 10000000000LL) {
+		return;
+	}
+	d2sdrm_log(dev_fd, "d2sdrm: 10 s: %u jobs, pre %u (%llu MB, submit %lld ms), out %u (%llu MB), "
+	    "seed skip %u (%llu MB)", st.jobs, st.pre, (unsigned long long)(st.pre_b >> 20),
+	    (long long)(st.submit_ns / 1000000), st.out, (unsigned long long)(st.out_b >> 20),
+	    st.seedskip, (unsigned long long)(st.seedskip_b >> 20));
+	d2sdrm_log(dev_fd, "d2sdrm: 10 s: post %u (%llu MB, %lld ms), waitbo %u, boflush %u (%llu MB), "
+	    "closewait %u, nolookup %u, hints %u, %s", st.post, (unsigned long long)(st.post_b >> 20),
+	    (long long)(st.post_ns / 1000000), st.waitbo, st.boflush,
+	    (unsigned long long)(st.boflush_b >> 20), st.closewait, st.nolookup, st.hints,
+	    flush_names[flush_mode]);
+	memset(&st, 0, sizeof(st));
+	st.since = t;
+}
+
+/*
+ * The job's handles as Mesa listed them (with patch-mesa25.py's access bits),
+ * deduplicated. Only those to be written back go to the kernel (see the top of
+ * this file); every one remembers the job for WAIT_BO and GEM_CLOSE.
+ */
 static int
 submit(struct drm_panfrost_submit *a)
 {
-	const uint32_t *handles = (const uint32_t *)(uintptr_t)a->bo_handles;
+	const uint32_t *in = (const uint32_t *)(uintptr_t)a->bo_handles;
 	int js = (a->requirements & PANFROST_JD_REQ_FS) ? 0 : 1;
 	uint64_t seq = 0;
+	static uint8_t named[MAX_HANDLES];	/* this job's handles, for deduplication */
+	uint32_t h[256], pre[256], n = 0, npre = 0;
+	uint8_t wr[256];
+
 	if (a->bo_handle_count > 256) {
 		return fail(EINVAL);
 	}
-	if (d2sgpu_submit_async(conn, js, a->jc, handles, a->bo_handle_count, &seq) != KERN_SUCCESS) {
+	if (flush_mode < 0) {
+		read_policy();
+	}
+	for (uint32_t i = 0; i < a->bo_handle_count; i++) {
+		uint32_t v = in[i], k = v & H_MASK;
+		/* unknown access (no bit 30): assume the GPU may write it */
+		uint8_t w = !(v & H_HINT) || (v & H_WRITE);
+		if (v & H_HINT) {
+			st.hints++;
+		}
+		if (bo_get(k) == NULL) {
+			continue;
+		}
+		if (named[k]) {
+			for (uint32_t m = 0; m < n; m++) {
+				if (h[m] == k) {
+					wr[m] |= w;
+				}
+			}
+			continue;
+		}
+		named[k] = 1;
+		h[n] = k;
+		wr[n] = w;
+		n++;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		struct bo *b = &bos[h[i]];
+		int heap = b->kind == BO_OWN && (b->create_flags & PANFROST_BO_HEAP);
+		int list;
+		if (flush_mode == FLUSH_ALL) {
+			list = 1;
+		} else if (heap) {
+			list = 0;
+		} else if (flush_mode == FLUSH_NOHEAP) {
+			list = 1;
+		} else if (b->kind == BO_OWN) {
+			list = b->mapped;
+		} else {
+			uint32_t seed = b->surface != NULL ? IOSurfaceGetSeed(b->surface) : 0;
+			list = !seed_skip || b->surface == NULL || !b->listed || b->mapped || seed != b->seed;
+			if (list) {
+				b->listed = 1;
+				b->seed = seed;
+			} else {
+				st.seedskip++;
+				st.seedskip_b += b->buf.size;
+			}
+		}
+		if (list) {
+			pre[npre++] = h[i];
+			st.pre_b += b->buf.size;
+		} else if (b->kind == BO_OWN) {
+			st.out++;
+			st.out_b += b->buf.size;
+		}
+	}
+	int64_t t0 = now_ns();
+	kern_return_t kr = d2sgpu_submit_async(conn, js, a->jc, pre, npre, &seq);
+	st.submit_ns += now_ns() - t0;
+	for (uint32_t i = 0; i < n; i++) {
+		named[h[i]] = 0;
+	}
+	if (kr != KERN_SUCCESS) {
 		d2sdrm_log(dev_fd, "d2sdrm: SUBMIT jc %#llx js %d failed", (unsigned long long)a->jc, js);
 		return fail(EINVAL);
 	}
+	for (uint32_t i = 0; i < n; i++) {
+		struct bo *b = &bos[h[i]];
+		int heap = b->kind == BO_OWN && (b->create_flags & PANFROST_BO_HEAP);
+		b->last_seq = seq;
+		int post = flush_mode == FLUSH_ALL ? 1 : flush_mode == FLUSH_NOHEAP ? !heap :
+		    (b->kind == BO_SURFACE && wr[i]);
+		if (post) {
+			if (b->post_seq == 0) {
+				post_pending++;
+			}
+			b->post_seq = seq;
+		}
+	}
+	st.jobs++;
+	st.pre += npre;
 	struct syncobj *s = a->out_sync ? sync_get(a->out_sync) : NULL;
 	if (s != NULL) {
 		s->seq = seq;
 		s->signaled = 0;
 	}
-	int slot = (int)(seq % NJOBS);
-	jobs[slot].seq = seq;
-	jobs[slot].n = a->bo_handle_count < JOB_BOS ? a->bo_handle_count : JOB_BOS;
-	jobs[slot].flushed = 0;
-	memcpy(jobs[slot].h, handles, jobs[slot].n * sizeof(uint32_t));
+	stats_report();
 	return 0;
 }
 
@@ -674,16 +922,32 @@ wait_bo(struct drm_panfrost_wait_bo *a)
 	if (bo == NULL) {
 		return fail(EINVAL);
 	}
-	struct d2sgpu_buf b = bo->buf;
-	pthread_mutex_unlock(&lock);
-	uint64_t rc;
-	uint32_t us;
-	do {	/* absolute deadline, like the kernel's; negative = forever */
-		us = left_us(a->timeout_ns);
-		rc = d2sgpu_buf_wait(conn, &b, us);
-	} while (rc == D2SGPU_JOB_TIMEOUT && us == 5000000);
-	pthread_mutex_lock(&lock);
-	return rc == D2SGPU_JOB_TIMEOUT ? fail(ETIMEDOUT) : 0;
+	/* Its newest job is ours to know (lean submits do not list it to the kernel). */
+	uint32_t h = a->handle;
+	st.waitbo++;
+	if (bo->last_seq > seen_done) {
+		uint64_t seq = bo->last_seq;
+		pthread_mutex_unlock(&lock);
+		uint64_t rc = wait_seq(seq, a->timeout_ns);	/* absolute; negative = forever */
+		pthread_mutex_lock(&lock);
+		if (rc == D2SGPU_JOB_TIMEOUT) {
+			return fail(ETIMEDOUT);
+		}
+		bo = bo_get(h);
+		if (bo == NULL) {
+			return 0;
+		}
+	}
+	/* Mesa waits before the CPU reads (panfrost_bo_wait): a mapped buffer the GPU
+	 * used since its lines were last dropped is flushed now (BUF_WAIT did that for
+	 * every buffer before); a buffer Mesa never mapped is flushed when it maps it. */
+	if ((bo->mapped || flush_mode == FLUSH_ALL) && bo->last_seq > bo->clean_seq) {
+		buf_flush(h);
+		st.boflush++;
+		st.boflush_b += bo->buf.size;
+		bo->clean_seq = bo->last_seq;
+	}
+	return 0;
 }
 
 static int

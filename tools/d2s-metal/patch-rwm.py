@@ -16,6 +16,10 @@ behaviour is still there to read:
     absent, which it always is on the d2s
   - RedwoodMetalDevice answers -supportsFamily: safely on a device Metal has
     not added yet (the boot-v12mtl crash, see FAM_* below)
+  - Boot A: a command buffer that draws into an IOSurface finishes inside
+    -commit (present race), and the device sets CoreAnimation's
+    CA_DISABLE_LUMA_BOOST / CA_DISABLE_GENERIC_SHADERS /
+    CA_DISABLE_DISPLAY_OVERDRIVE_FIX in-process (D2S_* below)
 
 Each replacement must match exactly once. Idempotent.
 """
@@ -113,11 +117,93 @@ d2s_mtldevice_imp(const char *name)
 #endif
 '''
 
+# Boot A (research/GPU_PLAN_2026-11-23.md 2.7 and 3.3).
+#
+# Present race: CoreAnimation swaps after -waitUntilScheduled (QuartzCore 20H392,
+# CA::OGL::MetalContext::flush), which y2sios answers at once because its kernel display
+# waits for a surface's GPU fence (RedwoodMaliSurfaceDrawn). Our SweetFramebuffer copies
+# a swapped IOSurface at once and has no such wait, so a command buffer that draws into
+# an IOSurface takes the synchronous road in -commit (RWM_SYNC's): the GPU has finished
+# and d2sdrm has dropped the surface's CPU cache lines before CoreAnimation swaps.
+# D2S_RWM_ASYNC_SURFACES=1 turns it off.
+#
+# CoreAnimation switches: CA_* options are read only from the environment on a retail
+# build (CADefaultsGetInt: getenv first, CFPreferences only on internal builds), and
+# d2senv carries one variable, so the device sets them in-process through QuartzCore's
+# exported CASetDebugOption, looked up by name (tools/d2s-metal/rwd_d2s.c).
+D2S_PROTOS_RWM = ('#ifdef D2S_METAL\n'
+                  'void d2s_ca_options(void);\t\t/* tools/d2s-metal/rwd_d2s.c */\n'
+                  'void d2s_ca_options_log(void);\n'
+                  '#endif\n')
+D2S_INIT_OLD = '\t_acceleratorService = port;\n'
+D2S_INIT_NEW = D2S_INIT_OLD + '#ifdef D2S_METAL\n\td2s_ca_options();\t/* before CoreAnimation builds its pipelines */\n#endif\n'
+D2S_COMMIT_OLD = '- (void)commit\n{\n\tchar why[512] = { 0 };\n'
+D2S_COMMIT_NEW = r'''#ifdef D2S_METAL
+/* d2s (patch-rwm.py, present race): does this command buffer draw or clear into an
+ * IOSurface? Our display copies a swapped surface at once; it must be finished. */
+static int d2s_surface_sync = -1;
+static uint64_t d2s_commits, d2s_sync_commits, d2s_report_ns;
+
+static BOOL
+d2s_commit_waits(NSArray *work)
+{
+	BOOL wait = NO;
+
+	if (d2s_surface_sync < 0) {
+		const char *e = getenv("D2S_RWM_ASYNC_SURFACES");
+
+		d2s_surface_sync = !(e != NULL && e[0] == '1');
+		d2s_ca_options_log();
+		m2m_log('I', "PERF", "d2s: a command buffer that draws into an IOSurface %s\n",
+		    d2s_surface_sync ? "finishes inside -commit (present race fix)"
+				     : "is asynchronous (D2S_RWM_ASYNC_SURFACES=1)");
+	}
+	if (d2s_surface_sync) {
+		for (RedwoodMetalWork *w in work) {
+			for (unsigned i = 0; i < w->colorCount && i < 8 && !wait; i++) {
+				id t = w->color[i];
+
+				wait = t != nil && [t respondsToSelector:@selector(iosurface)] &&
+				    [t iosurface] != nil;
+			}
+			if (wait) {
+				break;
+			}
+		}
+	}
+	uint64_t now = rw_now_ns();
+
+	d2s_commits++;
+	d2s_sync_commits += wait;
+	if (d2s_report_ns == 0) {
+		d2s_report_ns = now;
+	} else if (now - d2s_report_ns >= 10000000000ULL) {
+		m2m_log('I', "PERF", "d2s: 10 s: %llu commits, %llu into an IOSurface waited for the GPU\n",
+		    (unsigned long long)d2s_commits, (unsigned long long)d2s_sync_commits);
+		d2s_commits = d2s_sync_commits = 0;
+		d2s_report_ns = now;
+	}
+	return wait;
+}
+#endif
+
+''' + D2S_COMMIT_OLD
+D2S_ASYNC_OLD = '\tif (queued && mesa.submit != NULL && mesa.fence_wait != NULL && !_tracing && !rw_sync_commits()) {\n'
+D2S_ASYNC_NEW = ('#ifdef D2S_METAL\n'
+                 '\tif (queued && mesa.submit != NULL && mesa.fence_wait != NULL && !_tracing && !rw_sync_commits() &&\n'
+                 '\t    !d2s_commit_waits(_work)) {\n'
+                 '#else\n' + D2S_ASYNC_OLD + '#endif\n')
+
 EDITS = [
     ('redwoodmetal.m', FAM_IVAR_OLD, FAM_IVAR_NEW),
     ('redwoodmetal.m', FAM_METH_OLD, FAM_METH_NEW),
     ('redwoodmetal.m', AIR_OLD, AIR_NEW),
     ('redwoodmetal.m', '#include "redwood_drawable.h"\n', '#include "redwood_drawable.h"\n' + AIR_DEF),
+    ('redwoodmetal.m', '#include "redwood_drawable.h"\n' + AIR_DEF,
+     '#include "redwood_drawable.h"\n' + AIR_DEF + D2S_PROTOS_RWM),
+    ('redwoodmetal.m', D2S_INIT_OLD, D2S_INIT_NEW),
+    ('redwoodmetal.m', D2S_COMMIT_OLD, D2S_COMMIT_NEW),
+    ('redwoodmetal.m', D2S_ASYNC_OLD, D2S_ASYNC_NEW),
     ('redwooddrawable.m', AIR_OLD, AIR_NEW),
     ('redwooddrawable.m', '#include "redwood_drawable.h"\n',
      '#include "redwood_drawable.h"\n' + AIR_DEF + PROTOS),

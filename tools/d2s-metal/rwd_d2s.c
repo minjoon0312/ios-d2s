@@ -14,9 +14,12 @@
  *   d2s_m2m_sink          y2sios's mali2metal log records (m2m.h) go to /dev/m2m, which the
  *                         d2s has not got: send them to the kernel log through d2sdrm_log,
  *                         the "D2S GPU UC" path pantest uses.
+ *   d2s_ca_options        CoreAnimation's CA_* switches set in-process (Boot A, below).
  */
 #include <dlfcn.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -97,6 +100,83 @@ d2s_rwd_surface_call(struct rwd_surface *surface, const char *what, char *why, s
 	}
 	CFRelease(s);
 	return 0;
+}
+
+/*
+ * Boot A (research/GPU_PLAN_2026-11-23.md 3.3): CoreAnimation's own switches, set in this
+ * process when the Metal device is made (patch-rwm.py calls this from
+ * -initWithAcceleratorPort:, before CoreAnimation builds its pipelines). On a retail iOS
+ * QuartzCore reads CA_* only with getenv (CADefaultsGetInt; the com.apple.coreanimation
+ * preferences only on internal builds), and our d2senv boot-arg carries one variable, so
+ * they go through QuartzCore's exported CASetDebugOption, found by NAME
+ * (CAGetDebugOptionEnvVariableName: the indices move between iOS builds). Verified in
+ * 20H392 that each is read per frame or per draw, not only at start:
+ *   CA_DISABLE_LUMA_BOOST             index 91, IOMFBDisplay::begin_update: no luma boost pass
+ *   CA_DISABLE_GENERIC_SHADERS        index 82, MetalContext::draw/warmup_shaders: only the
+ *                                     small specialised pipelines, not the uber shader
+ *                                     (seconds to compile through AIR -> NIR -> Bifrost)
+ *   CA_DISABLE_DISPLAY_OVERDRIVE_FIX  index 50: no OLED overdrive pass (Apple's panel tuning)
+ * A variable already in the environment wins. D2S_CA_OPTIONS=0: leave them all alone.
+ */
+static char ca_note[200];
+
+void
+d2s_ca_options(void)
+{
+	static const char *const want[] = { "CA_DISABLE_LUMA_BOOST", "CA_DISABLE_GENERIC_SHADERS",
+					    "CA_DISABLE_DISPLAY_OVERDRIVE_FIX" };
+	static const char *const shorts[] = { "LUMA_BOOST", "GENERIC_SHADERS", "OVERDRIVE_FIX" };
+	const char *e = getenv("D2S_CA_OPTIONS");
+	if (e != NULL && e[0] == '0') {
+		snprintf(ca_note, sizeof(ca_note), "d2s: CA options left alone (D2S_CA_OPTIONS=0)");
+		return;
+	}
+	const char *(*name)(unsigned) = (const char *(*)(unsigned))dlsym(RTLD_DEFAULT,
+	    "CAGetDebugOptionEnvVariableName");
+	void (*set)(unsigned, uint8_t) = (void (*)(unsigned, uint8_t))dlsym(RTLD_DEFAULT,
+	    "CASetDebugOption");
+	if (name == NULL || set == NULL) {
+		snprintf(ca_note, sizeof(ca_note), "d2s: CA options: no QuartzCore in this process");
+		return;
+	}
+	size_t at = (size_t)snprintf(ca_note, sizeof(ca_note), "d2s: CA options disabled:");
+	for (unsigned w = 0; w < sizeof(want) / sizeof(want[0]); w++) {
+		const char *how = "not found";
+		char idx[24] = "";
+		for (unsigned i = 0; i < 0x200; i++) {
+			const char *n = name(i);
+			if (n != NULL && strcmp(n, want[w]) == 0) {
+				if (getenv(want[w]) != NULL) {
+					how = "env";
+				} else {
+					set(i, 1);
+					how = "set";
+				}
+				snprintf(idx, sizeof(idx), "#%u", i);
+				break;
+			}
+		}
+		if (at < sizeof(ca_note)) {
+			at += (size_t)snprintf(ca_note + at, sizeof(ca_note) - at, " %s %s%s", shorts[w], how, idx);
+		}
+	}
+}
+
+/* The note above, once, to the kernel log (d2sdrm is open by the first commit). */
+void
+d2s_ca_options_log(void)
+{
+	static int done;
+	void (*log_fn)(int, const char *, ...);
+	if (done || ca_note[0] == '\0') {
+		return;
+	}
+	done = 1;
+	*(void **)&log_fn = dlsym(RTLD_DEFAULT, "d2sdrm_log");
+	printf("%s\n", ca_note);
+	if (log_fn != NULL) {
+		log_fn(-1, "rwm: %s", ca_note);
+	}
 }
 
 void
